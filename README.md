@@ -10,6 +10,7 @@
 | `remove_window_shadow` | 关掉所有普通窗口的阴影                           |
 | `apps_toggle`          | 启动器打开时再点 Dock 图标能正常关闭（macOS 26 的 bug） |
 | `menu_bar_line`        | 菜单栏漂成纯白，并压掉底边那条 1pt 深灰线               |
+| `finder_sidebar`       | Finder 侧栏选中行换一块更明显的浅色底（墨水屏上原色几乎看不出） |
 
 配置文件 `~/.config/dock-tools/config.conf`，保存后约 2 秒生效。  
 程序本体从 `~/Library/Application Support/dock-tools/` 启动（launchd 读不了 NFS）；  
@@ -48,7 +49,29 @@ Chrome 右键菜单（layer 101）也是毛玻璃。同样在它后面垫白色�
 macOS 26 里启动器（`com.apple.campo`）打开时，点 Dock 图标不会关闭它。  
 用 CGEvent tap 监听点击，命中 Dock 的「启动器」格子且启动器正开着时，补发一次 AX press。
 
-### 5. 菜单栏漂白（`menu_bar_line`）
+### 5. Finder 侧栏选中（`finder_sidebar`）
+
+墨水屏上 Finder 侧栏的选中条几乎看不出来：实测选中底是 (224,224,224)、
+侧栏底色是 (246,246,246)，只差 **22 级灰度**，这块屏的灰阶分辨力把它压平了。
+
+系统没有可用的开关：侧栏选中不走 accent 色（那是给列表选中行的橙底白字），
+`AppleHighlightColor` 只管文字选中，`increaseContrast` 已经开着也没用。
+所以用和 Dock 白板同一套办法：读 AX 拿到选中行的矩形，贴一块 alpha 0.55 的浅蓝，
+底下的图标和文字照常透出来，只是把背景压深一档。
+
+关键是**怎么查 AX**。这一点决定了方案贵不贵：
+
+| 做法 | 耗时 |
+| --- | --- |
+| 盲目遍历整棵 AX 树 | **122 ms** |
+| 走固定路径 `window → AXSplitGroup[0] → AXScrollArea[0] → AXOutline` | **0.44 ms** |
+
+拿到 outline 后读 `AXSelectedRowsAttribute` 就是选中行。
+刷新用 **AX 事件驱动**（`AXSelectedRowsChanged` + `AXFocusedUIElementChanged`），
+空闲时 0 唤醒、0 CPU；切走 Finder 时立刻隐藏。
+只在 Finder 前台时生效，其它 App 的侧栏不受影响。
+
+### 6. 菜单栏漂白（`menu_bar_line`）
 
 「降低透明度」开着时系统把菜单栏画成不透明灰（实测 sRGB 218），  
 并在底边压一条 1pt 深灰线（约 120）。彩墨屏上菜单栏和背景窗几乎同色。
@@ -72,12 +95,13 @@ AX 读不到里面的元素，所以没法「只重绘背景、保留图标」�
 
 ## 性能消耗
 
-<|start|> 组件                          | CPU              | 内存            |
-| --------------------------- | ---------------- | ------------- |
-| 菜单栏漂白（常驻 stream）           | 约 0.15%          | 位图约 1–2 MB    |
-| Dock 白板（4Hz 轮询，指针远离 Dock）  | 约 0.05%          | 约 10 MB       |
+| 组件 | CPU | 内存 |
+| --- | --- | --- |
+| 菜单栏漂白（常驻 stream + 1fps 心跳）| 约 0.15%          | 位图约 1–2 MB    |
+| Dock 白板（2Hz 轮询，指针远离 Dock）  | 约 0.05%          | 约 10 MB       |
 | 启动器点击修正                     | 约 0.01%          | 约 7 MB        |
-| `dock-helper` 合计             | **约 0.23~0.30%** | 17~67 MB（见下） |
+| Finder 侧栏（AX 事件驱动）          | **0.00%**（0 唤醒）| 约 10 MB       |
+| `dock-helper` 合计             | **约 0.2~0.35%** | 17~67 MB（见下） |
 | `menu-shade`                | 0%（无定时器）         | 约 60 MB       |
 | 守护脚本                        | **约 0.05%**      | 约 3 MB        |
 

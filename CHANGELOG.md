@@ -2,6 +2,48 @@
 
 记录 dock-tools 的优化历程和重要变更。README 只保留当前状态，历史细节放这里。
 
+## 第五轮优化（2026-11-14）：Finder 侧栏选中 + 纯事件驱动
+
+墨水屏上 Finder 侧栏的选中条几乎看不出：选中底 224、侧栏底 246，只差 22 级灰度。
+
+试过但无效的系统设置：
+
+| 方案 | 结果 |
+| --- | --- |
+| 换 8 种 accent 色 | 最好的是黄色，但白字对比度只有 2.08:1（橙色 3.47:1 反而更好） |
+| `AppleHighlightColor` | 只管文字选中，对列表/侧栏选中行无效 |
+| `AppleAccentColorCustom` | 无效 |
+| `increaseContrast` | 本来就开着，且 TCC 保护 |
+| 浅底深字 | 系统在列表选中行上强制白字，侧栏则是灰底深字——两者都不受配置控制 |
+
+最终用叠加层：读 AX 拿选中行矩形，贴一块 alpha 0.55 的浅蓝（文字/图标仍透出来）。
+
+### 性能关键：怎么查 AX
+
+| 做法 | 耗时 |
+| --- | --- |
+| 盲目遍历整棵 AX 树 | **122 ms** |
+| 走固定路径 `window → AXSplitGroup[0] → AXScrollArea[0] → AXOutline` | **0.44 ms** |
+
+0.44ms 才是这个方案能成立的原因；122ms 那种做法（每个 App 都扫一遍）根本没法用。
+
+### 从轮询改成纯事件驱动
+
+| | 之前 | 现在 |
+| --- | --- | --- |
+| 刷新方式 | 5Hz 轮询（AX 查询 0.44ms × 5 = 0.2%） | `AXSelectedRowsChanged` + `AXFocusedUIElementChanged` |
+| 空闲开销 | 约 0.2%（稳定后） | **0.00%，0 唤醒** |
+| 跟随延迟 | 约 200ms | 约 150ms（事件即时触发） |
+
+`AXObserverAddNotification` 对 outline 上的 `AXSelectedRowsChanged` 返回 0（可用），
+实测点侧栏、键盘上下移动都能触发。Finder 重启（pid 变）和睡眠唤醒后重新订阅。
+
+### 其它
+
+- 补丁只在 Finder 前台显示，切走立刻隐藏（之前会挂在最后一个前台窗口上）
+- Dock 白板空闲档 4Hz → 2Hz
+- 移除全局 `NSEvent` 监听（实测空闭包就要 0.27%）
+
 ## 第四轮优化（2026-11-14）：指针跟踪 + idle 帧 + 缓存
 
 真正的开销来源：`NSEvent` 全局监听（哪怕空闭包也要 0.27% 单核），笔屏有悬停漂移时指针一直在发事件，等于监听成本永远付满。
@@ -76,7 +118,7 @@
 
 ```
 dock/
-├── dock-helper.swift      # 主进程：Dock 白板 + 启动器修正 + 菜单栏漂白
+├── dock-helper.swift      # 主进程：Dock 白板 + 启动器修正 + 菜单栏漂白 + Finder 侧栏
 ├── menu-shade.swift       # Chrome 右键菜单白底（独立进程，0% CPU）
 ├── dock-tools.sh          # 守护脚本 + apply/status/build/install
 ├── dock-white.sh          # 换纯白壁纸（不可自动还原）

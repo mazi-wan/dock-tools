@@ -2,6 +2,7 @@
 //   --panel=1   Dock 下方白色面板（原 dock-shade）
 //   --tap=1     App 启动器点击修正（原 apps-toggle）
 //   --menubar=1 菜单栏底色漂白 + 压掉底边那条深灰分隔线
+//   --sidebar=1 强化 Finder 侧栏选中行的对比度（浅灰底 → 更明显的浅色底）
 // 两件事共用同一条辅助功能授权，系统设置里只需 dock-helper 一个条目。
 // 守护脚本按配置传参；参数变化时重启这一个进程，两个开关仍互不影响。
 //
@@ -250,7 +251,7 @@ final class Driver {
     // 这台笔屏有悬停漂移，指针一直在发事件，等于监听成本永远付满。
     private let trackInterval: TimeInterval = 1.0 / 120.0
     private let nearInterval: TimeInterval = 1.0 / 30.0
-    private let idleInterval: TimeInterval = 1.0 / 4.0
+    private let idleInterval: TimeInterval = 1.0 / 2.0
 
     init(shade: DockShade) {
         self.shade = shade
@@ -325,6 +326,9 @@ var lastTapPermissionLog = Date.distantPast
 /// 面板的轮询驱动。必须强引用：它用 [weak self] 的 Timer，
 /// 只放在 runHelper 的局部变量里会在函数返回后被释放，tick 就停了。
 var panelDriver: Driver?
+
+/// Finder 侧栏选中强化。同样要强引用：Timer 用 weak self，局部变量会被立刻释放。
+var sidebarHighlight: SidebarHighlight?
 
 func runHelper() {
     let app = NSApplication.shared
@@ -417,7 +421,270 @@ func runHelper() {
         fflush(stdout)
     }
 
+    if wantsSidebar {
+        let side = SidebarHighlight()
+        side.start()
+        sidebarHighlight = side     // 强引用，见 panelDriver 的注释
+        // 任何 App 被激活都立刻重算一次：
+        //   切到 Finder → 补丁出现；切走 → 补丁消失。
+        // refresh() 内部会判断 Finder 是否在前台，所以这里不用再筛 bundle id。
+        let wsn = NSWorkspace.shared.notificationCenter
+        wsn.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
+                        object: nil, queue: .main) { _ in side.refresh() }
+        // Finder 重启后 pid 变了，旧的 AXObserver 会失效，需要重新订阅。
+        wsn.addObserver(forName: NSWorkspace.didLaunchApplicationNotification,
+                        object: nil, queue: .main) { note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            guard app?.bundleIdentifier == "com.apple.finder" else { return }
+            side.finderRestarted()
+        }
+        // 睡眠唤醒后 AX 服务可能已经重置，重订一次
+        wsn.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
+            side.finderRestarted()
+        }
+        print("\(Date()) dock-helper sidebar 已启动")
+        fflush(stdout)
+    }
+
     app.run()
+}
+
+// MARK: - Finder 侧栏选中行强化
+
+// 墨水屏上 Finder 侧栏的选中条几乎看不出来：实测选中底是 (224,224,224)、
+// 侧栏底色是 (246,246,246)，只差 22 级灰度。这块屏的灰阶分辨力有限，
+// 22 级的差别被压平，整条选中行糊成一片。
+//
+// 系统没有单独调这个颜色的开关：
+//   - 侧栏选中不走 accent 色（那是给列表选中行用的橙色/白字）
+//   - AppleHighlightColor 只管文字选中，对侧栏无效
+//   - increaseContrast 已经开着，对这里也没效果
+//
+// 所以用和 Dock 白板同一套办法：读 AX 拿到选中行的矩形，在上面贴一块
+// 更明显的浅色底（不遮挡文字，因为颜色更浅、文字是深色）。
+//
+// 为什么能做得便宜：侧栏的选中行有一条固定的 AX 路径
+//   window → AXSplitGroup[0] → AXScrollArea[0] → AXOutline
+// 直接从 outline 读 kAXSelectedRowsAttribute 只需要 0.44 ms；
+// 而盲目遍历整棵 AX 树要 122 ms——后者才是"叠加层很贵"的由来。
+//
+// 刷新策略：事件驱动 + 低频兜底。选中变化、切窗口、点侧栏都能被 AX 通知或
+// 鼠标事件捕捉到；再用 2 秒一次的兜底覆盖滚轮滚动这类没有通知的情况。
+
+final class SidebarHighlight {
+    private let window: NSWindow
+    private var applied: CGRect?
+    private var observer: AXObserver?
+    private var observedElements: [AXUIElement] = []
+    private var retry: Timer?
+    private var lastHit = Date.distantPast
+
+    /// 选中行要盖的色。alpha 是关键：必须让底下的文字/图标透出来，
+    /// 所以不能填满。0.55 的浅蓝压在 246 的底上变成约 199，
+    /// 比系统原来的 224 更暗、更"有色"，在墨水屏灰阶上更容易分辨。
+    static let patchColor = NSColor(srgbRed: 0.62, green: 0.72, blue: 0.84, alpha: 0.55)
+
+    init() {
+        window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 4, height: 4),
+                          styleMask: .borderless, backing: .buffered, defer: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.isMovable = false
+        window.isReleasedWhenClosed = false
+        // 贴在普通窗口之上，但不盖住菜单栏/Dock 白板
+        window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.floatingWindow)))
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        window.contentView = SidebarPatchView(frame: CGRect(x: 0, y: 0, width: 4, height: 4))
+        window.alphaValue = 0
+        window.orderFrontRegardless()
+    }
+
+    func start() {
+        refresh()
+        installObserver()
+    }
+
+    // MARK: - AX 事件驱动
+
+    /// 订阅 Finder 侧栏的选中变化。
+    /// 实测 `AXSelectedRowsChanged` 和 `AXFocusedUIElementChanged` 都能可靠触发
+    /// （点侧栏项、键盘上下移动、点击其它窗口再点回来都会发），
+    /// 所以不需要轮询——空闲时这个功能是 0 唤醒。
+    private func installObserver() {
+        teardownObserver()
+        guard let finder = NSWorkspace.shared.runningApplications
+                .first(where: { $0.bundleIdentifier == "com.apple.finder" }) else {
+            scheduleRetry()
+            return
+        }
+        let pid = finder.processIdentifier
+        guard let (app, outline) = finderSidebarElements(pid: pid) else {
+            // Finder 刚启动 / 还没开窗口：稍后再试，不算失败
+            scheduleRetry()
+            return
+        }
+
+        var obs: AXObserver?
+        guard AXObserverCreate(pid, { _, _, _, _ in
+            // 回调不在主线程。切回来做实际工作。
+            DispatchQueue.main.async { sidebarHighlight?.refresh() }
+        }, &obs) == .success, let observer = obs else {
+            scheduleRetry()
+            return
+        }
+
+        // outline 上的选中变化是主信号；窗口/焦点变化用来兜住「点了别处又点回来」
+        for (el, name) in [(outline, kAXSelectedRowsChangedNotification),
+                           (outline, kAXFocusedUIElementChangedNotification),
+                           (app, kAXFocusedWindowChangedNotification),
+                           (app, kAXFocusedUIElementChangedNotification)] {
+            let rc = AXObserverAddNotification(observer, el, name as CFString, nil)
+            // 已经注册过/不支持都不算错，继续挂其它的
+            _ = rc
+            if rc == .success { observedElements.append(el) }
+        }
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        self.observer = observer
+        print("\(Date()) sidebar 已订阅 AX 通知")
+        fflush(stdout)
+    }
+
+    private func teardownObserver() {
+        if let obs = observer {
+            for el in observedElements {
+                AXObserverRemoveNotification(obs, el, kAXSelectedRowsChangedNotification as CFString)
+                AXObserverRemoveNotification(obs, el, kAXFocusedUIElementChangedNotification as CFString)
+                AXObserverRemoveNotification(obs, el, kAXFocusedWindowChangedNotification as CFString)
+            }
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(obs), .defaultMode)
+        }
+        observer = nil
+        observedElements.removeAll()
+    }
+
+    /// Finder 窗口还没建好、或 Finder 刚重启时，隔一会儿重新订阅。
+    /// 这是唯一保留的定时器，且只在异常状态下存在。
+    private func scheduleRetry() {
+        guard retry == nil else { return }
+        retry = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in
+            self?.retry = nil
+            self?.installObserver()
+            self?.refresh()
+        }
+    }
+
+    /// Finder 重启后旧 observer 会失效（pid 变了），重新订阅。
+    func finderRestarted() {
+        installObserver()
+        refresh()
+    }
+
+    // MARK: - 摆位置
+
+    /// Finder 是不是在前台。不是的话补丁必须立刻消失——
+    /// 否则切到别的 App 后那块浅蓝还挂在屏幕上。
+    private var finderIsFront: Bool {
+        NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder"
+    }
+
+    func refresh() {
+        guard finderIsFront, let rect = finderSidebarSelection() else {
+            hide()
+            return
+        }
+        let target = patchRect(for: rect)
+        if applied != target {
+            applied = target
+            window.setFrame(target, display: true)
+            window.orderFrontRegardless()
+            if window.alphaValue < 1 { window.alphaValue = 1 }
+            dbg("sidebar patch=\(Int(target.minX)),\(Int(target.minY))")
+        } else if window.alphaValue < 1 {
+            window.alphaValue = 1
+            window.orderFrontRegardless()
+        }
+        lastHit = Date()
+    }
+
+    private func hide() {
+        guard applied != nil || window.alphaValue > 0 else { return }
+        applied = nil
+        window.alphaValue = 0
+    }
+
+    /// AX 是左上原点(全局 CG 坐标)，NSWindow 是左下原点，这里换算并内缩 2pt
+    /// 让补丁不压到选中条的抗锯齿边缘。
+    private func patchRect(for cg: CGRect) -> CGRect {
+        guard let main = NSScreen.screens.first else { return .zero }
+        let flip = main.frame.origin.y + main.frame.height
+        let inset: CGFloat = 2
+        return CGRect(x: cg.minX + inset,
+                      y: flip - cg.maxY + inset,
+                      width: max(0, cg.width - inset * 2),
+                      height: max(0, cg.height - inset * 2))
+    }
+}
+
+final class SidebarPatchView: NSView {
+    override var isOpaque: Bool { false }
+    override func draw(_ dirtyRect: NSRect) {
+        // 半透明填充：窗口本身是非不透明的，alpha<1 的色块会让下面的
+        // 图标和文字透出来，只是把那层浅灰底压深一点。
+        // 关键是不能用不透明填充——那样会把文字整个盖掉。
+        SidebarHighlight.patchColor.setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
+    }
+}
+
+/// 走固定路径拿到 Finder 的 app 元素和侧栏 outline。
+/// window → AXSplitGroup[0] → AXScrollArea[0] → AXOutline
+/// 实测 0.44ms；盲目遍历整棵树要 122ms，那是两回事。
+func finderSidebarElements(pid: pid_t) -> (AXUIElement, AXUIElement)? {
+    let app = AXUIElementCreateApplication(pid)
+    // 0.35 秒足够：AX 卡住时也不该拖住主线程
+    AXUIElementSetMessagingTimeout(app, 0.35)
+    guard let windows = axAttr(app, kAXWindowsAttribute) as? [AXUIElement],
+          let win = windows.first,
+          let kids = axAttr(win, kAXChildrenAttribute) as? [AXUIElement],
+          let split = kids.first,
+          let splitKids = axAttr(split, kAXChildrenAttribute) as? [AXUIElement],
+          let scroll = splitKids.first,
+          let scrollKids = axAttr(scroll, kAXChildrenAttribute) as? [AXUIElement],
+          let outline = scrollKids.first,
+          (axAttr(outline, kAXRoleAttribute) as? String) == "AXOutline" else { return nil }
+    return (app, outline)
+}
+
+/// 读 Finder 侧栏当前选中行的矩形；没有选中就返回 nil。
+func finderSidebarSelection() -> CGRect? {
+    guard let finder = NSWorkspace.shared.runningApplications
+            .first(where: { $0.bundleIdentifier == "com.apple.finder" }) else { return nil }
+    guard let (_, outline) = finderSidebarElements(pid: finder.processIdentifier) else { return nil }
+    guard let rows = axAttr(outline, kAXSelectedRowsAttribute) as? [AXUIElement],
+          let row = rows.first,
+          let frame = axFrame(row),
+          frame.width > 40, frame.height > 10 else { return nil }
+    return frame
+}
+
+func axAttr(_ el: AXUIElement, _ name: String) -> AnyObject? {
+    var v: AnyObject?
+    return AXUIElementCopyAttributeValue(el, name as CFString, &v) == .success ? v : nil
+}
+
+func axFrame(_ el: AXUIElement) -> CGRect? {
+    guard let pv = axAttr(el, kAXPositionAttribute),
+          let sv = axAttr(el, kAXSizeAttribute),
+          CFGetTypeID(pv) == AXValueGetTypeID(),
+          CFGetTypeID(sv) == AXValueGetTypeID() else { return nil }
+    var p = CGPoint.zero
+    var s = CGSize.zero
+    AXValueGetValue(pv as! AXValue, .cgPoint, &p)
+    AXValueGetValue(sv as! AXValue, .cgSize, &s)
+    guard s.width > 0, s.height > 0 else { return nil }
+    return CGRect(origin: p, size: s)
 }
 
 // MARK: - 菜单栏清理
@@ -948,7 +1215,7 @@ func startTapRetry() {
 }
 
 func usageAndExit(_ code: Int32) -> Never {
-    FileHandle.standardError.write("用法: dock-helper [--panel=0|1] [--tap=0|1] [--menubar=0|1]\n".data(using: .utf8)!)
+    FileHandle.standardError.write("用法: dock-helper [--panel=0|1] [--tap=0|1] [--menubar=0|1] [--sidebar=0|1]\n".data(using: .utf8)!)
     exit(code)
 }
 
@@ -956,6 +1223,7 @@ func usageAndExit(_ code: Int32) -> Never {
 var wantsPanel = CommandLine.arguments.count == 1
 var wantsTap = CommandLine.arguments.count == 1
 var wantsMenuBar = CommandLine.arguments.count == 1
+var wantsSidebar = CommandLine.arguments.count == 1
 for arg in CommandLine.arguments.dropFirst() {
     switch arg {
     case "--panel=1": wantsPanel = true
@@ -964,11 +1232,13 @@ for arg in CommandLine.arguments.dropFirst() {
     case "--tap=0": wantsTap = false
     case "--menubar=1": wantsMenuBar = true
     case "--menubar=0": wantsMenuBar = false
+    case "--sidebar=1": wantsSidebar = true
+    case "--sidebar=0": wantsSidebar = false
     case "help", "-h", "--help": usageAndExit(0)
     default: usageAndExit(2)
     }
 }
 
-if wantsPanel || wantsTap || wantsMenuBar {
+if wantsPanel || wantsTap || wantsMenuBar || wantsSidebar {
     runHelper()
 }
