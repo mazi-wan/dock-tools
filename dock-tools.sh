@@ -6,7 +6,6 @@
 #   remove_window_shadow=1   关掉所有窗口的阴影（含底部最重的那圈）。
 #   apps_toggle=1            App 启动器打开时，再点 Dock 图标能正常关闭（macOS 26 的 bug 修正）。
 #   menu_bar_line=1          盖掉菜单栏底边那条 1pt 深灰线（「降低透明度」开着时系统会画）。
-#   finder_sidebar=1         强化 Finder 侧栏选中行的对比度（墨水屏上原色几乎看不出）。
 #   改 ~/.config/dock-tools/config.conf 保存后约 2 秒生效，不用重装。
 # 用法: dock-tools.sh [on|off|apply|revert|status|build|install|daemon]
 #   on      一键全开：把五项开关写成 1，安装并启动 LaunchAgent。
@@ -199,7 +198,7 @@ load_conf() {
     [ "$key_digest" = "${_conf_digest:-}" ] && return 0
     _conf_digest="$key_digest"
 
-    local dock_opaque=1 menu_white=1 remove_window_shadow=1 apps_toggle=1 menu_bar_line=0 finder_sidebar=0 poll=2
+    local dock_opaque=1 menu_white=1 remove_window_shadow=1 apps_toggle=1 menu_bar_line=0 poll=2
     local -a lines
     lines=("${(@f)content}")
     for line in "${lines[@]}"; do
@@ -217,7 +216,6 @@ load_conf() {
             remove_window_shadow)   [ -n "$val" ] && remove_window_shadow="$val" ;;
             apps_toggle)            [ -n "$val" ] && apps_toggle="$val" ;;
             menu_bar_line)          [ -n "$val" ] && menu_bar_line="$val" ;;
-            finder_sidebar)         [ -n "$val" ] && finder_sidebar="$val" ;;
             poll)                   [ -n "$val" ] && poll="$val" ;;
         esac
     done
@@ -229,7 +227,6 @@ load_conf() {
     REMOVE_WINDOW_SHADOW=$remove_window_shadow; [ "$REMOVE_WINDOW_SHADOW" = "0" ] || REMOVE_WINDOW_SHADOW=1
     APPS_TOGGLE=$apps_toggle;            [ "$APPS_TOGGLE" = "0" ] || APPS_TOGGLE=1
     MENU_BAR_LINE=$menu_bar_line;        [ "$MENU_BAR_LINE" = "0" ] || MENU_BAR_LINE=1
-    FINDER_SIDEBAR=$finder_sidebar;      [ "$FINDER_SIDEBAR" = "0" ] || FINDER_SIDEBAR=1
     POLL=$poll
     # poll=0 会让守护循环变成死循环空转
     [ "$POLL" -ge 1 ] 2>/dev/null || POLL=1
@@ -305,7 +302,6 @@ helper_running() { [ -n "$(helper_args)" ] }
 panel_running() { [[ "$(helper_args)" == *"--panel=1"* ]] }
 tap_running()   { [[ "$(helper_args)" == *"--tap=1"* ]] }
 menubar_running() { [[ "$(helper_args)" == *"--menubar=1"* ]] }
-sidebar_running() { [[ "$(helper_args)" == *"--sidebar=1"* ]] }
 
 kill_by_name() {
     # 不判断返回值：pgrep/pkill 在某些状态下会返回非零，配合 set -e 会直接中断脚本
@@ -359,18 +355,17 @@ daemon() {
         fi
 
         # 一个进程同时承担面板和点击修正，用参数说明开哪几项
-        if [ "$DOCK_OPAQUE" = "0" ] && [ "$APPS_TOGGLE" = "0" ] && [ "$MENU_BAR_LINE" = "0" ] \
-           && [ "$FINDER_SIDEBAR" = "0" ]; then
+        if [ "$DOCK_OPAQUE" = "0" ] && [ "$APPS_TOGGLE" = "0" ] && [ "$MENU_BAR_LINE" = "0" ]; then
             [ -n "$helper_pid" ] && { stop_helper; helper_pid=""; }
             started_flags=""
         else
-            local want_flags="panel=$DOCK_OPAQUE tap=$APPS_TOGGLE menubar=$MENU_BAR_LINE sidebar=$FINDER_SIDEBAR"
+            local want_flags="panel=$DOCK_OPAQUE tap=$APPS_TOGGLE menubar=$MENU_BAR_LINE"
             if [ "$want_flags" != "$started_flags" ] || [ -z "$helper_pid" ]; then
                 [ -n "$helper_pid" ] && stop_helper
                 "$HELPER_EXE" --panel="$DOCK_OPAQUE" --tap="$APPS_TOGGLE" \
-                    --menubar="$MENU_BAR_LINE" --sidebar="$FINDER_SIDEBAR" >>"$LOG" 2>&1 &
+                    --menubar="$MENU_BAR_LINE" >>"$LOG" 2>&1 &
                 helper_pid=$!
-                echo "$(date '+%F %T') 启动 dock-helper pid=$helper_pid (panel=$DOCK_OPAQUE tap=$APPS_TOGGLE menubar=$MENU_BAR_LINE sidebar=$FINDER_SIDEBAR)"
+                echo "$(date '+%F %T') 启动 dock-helper pid=$helper_pid (panel=$DOCK_OPAQUE tap=$APPS_TOGGLE menubar=$MENU_BAR_LINE)"
                 started_flags="$want_flags"
             fi
         fi
@@ -435,7 +430,6 @@ apply() {
     ensure_conf_key menu_white 1 "Chrome 右键菜单白底: 在菜单后面垫白板, 菜单不再透出网页内容。"
     ensure_conf_key apps_toggle 1 "App 启动器打开时再点 Dock 图标能正常关闭。"
     ensure_conf_key menu_bar_line 0 "菜单栏底边: 盖掉\"降低透明度\"在菜单栏下面画的那条 1pt 深灰线。"
-    ensure_conf_key finder_sidebar 0 "Finder 侧栏选中: 墨水屏上原色选中条几乎看不出，改贴一块浅色底。"
     mkdir -p "$HOME/Library/LaunchAgents" "$(dirname "$LOG")"
     make_plist > "$HOME/Library/LaunchAgents/${LABEL}.plist"
     local uid; uid=$(id -u)
@@ -465,7 +459,7 @@ apply() {
     load_conf
     if launchctl print "gui/${uid}/${LABEL}" >/dev/null 2>&1; then
         echo "已应用: ${LABEL}"
-        echo "配置: $CONF (dock_opaque=$DOCK_OPAQUE menu_white=$MENU_WHITE remove_window_shadow=$REMOVE_WINDOW_SHADOW apps_toggle=$APPS_TOGGLE menu_bar_line=$MENU_BAR_LINE finder_sidebar=$FINDER_SIDEBAR)"
+        echo "配置: $CONF (dock_opaque=$DOCK_OPAQUE menu_white=$MENU_WHITE remove_window_shadow=$REMOVE_WINDOW_SHADOW apps_toggle=$APPS_TOGGLE menu_bar_line=$MENU_BAR_LINE)"
         echo "日志: $LOG"
     else
         echo "启动失败，看 $LOG" >&2
@@ -507,14 +501,13 @@ revert() {
 status() {
     load_conf
     echo "配置: $CONF"
-    echo "  dock_opaque=$DOCK_OPAQUE  menu_white=$MENU_WHITE  remove_window_shadow=$REMOVE_WINDOW_SHADOW  apps_toggle=$APPS_TOGGLE  menu_bar_line=$MENU_BAR_LINE  finder_sidebar=$FINDER_SIDEBAR  poll=$POLL"
+    echo "  dock_opaque=$DOCK_OPAQUE  menu_white=$MENU_WHITE  remove_window_shadow=$REMOVE_WINDOW_SHADOW  apps_toggle=$APPS_TOGGLE  menu_bar_line=$MENU_BAR_LINE  poll=$POLL"
     echo "运行位置: $LOCAL_DIR"
     echo "服务: $(launchctl print gui/$(id -u)/${LABEL} >/dev/null 2>&1 && echo 运行中 || echo 未运行)"
     echo "面板: $(panel_running && echo 在跑 || echo 未运行)"
     echo "菜单白底: $(pgrep -x menu-shade >/dev/null 2>&1 && echo 在跑 || echo 未运行)"
     echo "启动器修正: $(tap_running && echo 在跑 || echo 未运行)"
     echo "菜单栏底边: $(menubar_running && echo 在跑 || echo 未运行)"
-    echo "Finder 侧栏: $(sidebar_running && echo 在跑 || echo 未运行)"
     echo "yabai: $(yabai_running && echo 运行中 || echo 未运行)"
     if yabai_running; then
         echo "有阴影的窗口: $(shadow_count)"

@@ -2,6 +2,27 @@
 
 记录 dock-tools 的优化历程和重要变更。README 只保留当前状态，历史细节放这里。
 
+## 移除 Finder 侧栏处理（2026-11-14）
+
+原来加过一个 `finder_sidebar` 开关，给 Finder 侧栏选中行贴半透明浅蓝底。
+功能本身是好的（AX 事件驱动、空闲 0 唤醒），但用户决定不要，整体移除：
+
+- `dock-helper.swift`：删掉 `SidebarHighlight` / `SidebarPatchView` /
+  `finderSidebarElements` / `finderSidebarSelection`，以及 `--sidebar` 参数
+- `dock-tools.sh`：删掉 `finder_sidebar` 配置项、`sidebar_running()`、daemon 传参
+- 配置文件里的 `finder_sidebar=1` 和它的注释一并清掉
+
+移除后的开销：`dock-helper` 从 0.33% 降到 **0.12%**（省掉侧栏模块初始化）。
+`axAttr` / `axFrame` 两个通用 AX 工具函数保留（面板功能还在用）。
+
+保留的技术结论（以后要用可以参考）：
+
+- 走固定路径查 AX 是 **0.44ms**，盲目遍历整棵树是 **122ms**
+- `AXObserverAddNotification` 对 outline 的 `AXSelectedRowsChanged` 返回 0（可用），
+  可以做到纯事件驱动、空闲 0 唤醒
+- 墨水屏上 Finder 侧栏选中底 224、侧栏底 246，只差 22 级灰度；系统没有可调开关
+  （accent 色只管列表选中行，`AppleHighlightColor` 只管文字选中）
+
 ## 第五轮优化（2026-11-14）：Finder 侧栏选中 + 纯事件驱动
 
 墨水屏上 Finder 侧栏的选中条几乎看不出：选中底 224、侧栏底 246，只差 22 级灰度。
@@ -118,7 +139,7 @@
 
 ```
 dock/
-├── dock-helper.swift      # 主进程：Dock 白板 + 启动器修正 + 菜单栏漂白 + Finder 侧栏
+├── dock-helper.swift      # 主进程：Dock 白板 + 启动器修正 + 菜单栏漂白
 ├── menu-shade.swift       # Chrome 右键菜单白底（独立进程，0% CPU）
 ├── dock-tools.sh          # 守护脚本 + apply/status/build/install
 ├── dock-white.sh          # 换纯白壁纸（不可自动还原）
