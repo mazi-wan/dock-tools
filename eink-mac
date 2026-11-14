@@ -1,0 +1,200 @@
+#!/bin/zsh
+# eink-mac — 在一台新的 macOS 上一键开启/关闭整个 e-ink 桌面外观方案。
+#   on (默认)  装依赖并开启全部项目:
+#              Dock 不透明 / Chrome 菜单白底(menu-shade) /
+#              去窗口阴影(yabai) / App 启动器点击修正 /
+#              窗口描边(JankyBorders)。加 --wallpaper 顺便换纯白壁纸。
+#   off        关闭全部并还原: 停工具、卸 LaunchAgent、恢复窗口阴影、停 yabai/borders。
+#              壁纸不会自动还原。
+#   status     逐项查看当前状态。
+#   uninstall  在 off 基础上彻底卸载 yabai / JankyBorders 和 sudoers 规则。
+# 仍需手动完成(脚本不能代做):
+#   1. 缺 Homebrew 或 Xcode 命令行工具时先装好再重跑。
+#   2. 辅助功能: 系统设置 → 隐私与安全性 → 辅助功能, 添加并勾选
+#      <本目录>/dock-helper。面板和启动器修正共用这一个条目;
+#      menu-shade 不需要授权。重新编译后 cdhash 会变: 先移除再加回。
+#   3. yabai 去阴影依赖脚本扩展, 需要部分关闭 SIP 并加 -arm64e_preview_abi 启动参数;
+#      没做的话其它项照常工作, 只是窗口阴影还在。
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+SELF="$HERE/$(basename "$0")"
+DT="$HERE/dock-tools.sh"
+WS_INSTALL="$HERE/install-window-style.sh"
+WS_UNINSTALL="$HERE/uninstall-window-style.sh"
+WHITE="$HERE/dock-white.sh"
+YRC="$HOME/.config/yabai/yabairc"
+BRC="$HOME/.config/borders/bordersrc"
+SUDOERS=/private/etc/sudoers.d/yabai
+
+BREW=""
+for p in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    [ -x "$p" ] && { BREW="$p"; break; }
+done
+YABAI=""
+BORDERS=""
+if [ -n "$BREW" ]; then
+    PREFIX=$("$BREW" --prefix)
+    YABAI="$PREFIX/bin/yabai"
+    BORDERS="$PREFIX/bin/borders"
+fi
+
+SA_OK=1
+
+say()  { print -r -- "$@" }
+warn() { print -r -- "警告: $*" >&2 }
+die()  { print -r -- "错误: $*" >&2; exit 1 }
+
+usage() {
+    sed -n '2,17p' "$SELF" | sed 's/^# \{0,1\}//'
+}
+
+preflight() {
+    local major
+    major=$(sw_vers -productVersion | cut -d. -f1)
+    (( major >= 14 )) || die "需要 macOS 14 或更高，当前 $(sw_vers -productVersion)"
+    command -v swiftc >/dev/null 2>&1 ||
+        die "缺少编译工具，先运行 xcode-select --install，装完重跑本脚本"
+    [ -f "$DT" ] || die "找不到 $DT，脚本要和 dock-tools.sh 放在同一目录"
+}
+
+deps_ready() {
+    [ -x "$YABAI" ] && [ -x "$BORDERS" ] && [ -f "$YRC" ] && [ -f "$BRC" ]
+}
+
+install_deps() {
+    [ -n "$BREW" ] || die "未安装 Homebrew，先运行官方安装脚本:
+  /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+    deps_ready && [ -f "$SUDOERS" ] && return 0
+    say "安装/修复 yabai 与 JankyBorders，过程中会要求输入一次 sudo 密码..."
+    "$WS_INSTALL"
+}
+
+ensure_yabai() {
+    pgrep -x yabai >/dev/null 2>&1 && return 0
+    say "启动 yabai..."
+    "$YABAI" --start-service >/dev/null 2>&1 || "$YABAI" --restart-service >/dev/null 2>&1 || true
+    sleep 1
+    pgrep -x yabai >/dev/null 2>&1 || warn "yabai 没起来，看 ~/Library/Logs/yabai.*.log"
+}
+
+ensure_borders() {
+    pgrep -x borders >/dev/null 2>&1 && return 0
+    say "启动 JankyBorders..."
+    "$BREW" services start FelixKratz/formulae/borders >/dev/null 2>&1 || true
+    sleep 1
+    pgrep -x borders >/dev/null 2>&1 ||
+        warn "JankyBorders 没起来，运行 brew services info FelixKratz/formulae/borders 查看"
+}
+
+verify_sa() {
+    # --load-sa 在已加载时也会返回非 0，所以按实际效果判断: 有可见窗口仍带阴影才算没生效
+    SA_OK=1
+    local n
+    n=$(shadow_count)
+    if [ "$n" != "0" ]; then
+        SA_OK=0
+        warn "仍有 $n 个可见窗口带阴影，yabai 脚本扩展可能没加载"
+        say "  → 去窗口阴影需要部分关闭 SIP 并添加 -arm64e_preview_abi 启动参数;"
+        say "    如果只是升级过 yabai，运行 $WS_INSTALL 刷新 sudoers 规则即可。"
+    fi
+}
+
+shadow_count() {
+    pgrep -x yabai >/dev/null 2>&1 || { echo 0; return 0; }
+    "$YABAI" -m query --windows 2>/dev/null | python3 -c '
+import json, sys
+n = 0
+for w in json.load(sys.stdin):
+    if w.get("has-shadow") and w.get("is-visible"):
+        n += 1
+print(n)' 2>/dev/null || echo 0
+}
+
+print_manual_steps() {
+    say ""
+    say "还需手动完成(每台机器一次):"
+    say "  系统设置 → 隐私与安全性 → 辅助功能: 添加并勾选"
+    say "    $HERE/dock-helper"
+    say "  面板和启动器修正共用这一个条目(menu-shade 不需要授权);"
+    say "  若列表里还有旧的 dock-shade / apps-toggle 条目，可以直接移除。"
+    if (( ! SA_OK )); then
+        say "  另外窗口仍有阴影，按上面的 yabai 脚本扩展提示处理。"
+    fi
+    say "  壁纸未改动; 想要纯白背景运行: $SELF on --wallpaper"
+}
+
+enable() {
+    local wallpaper="${1:-0}"
+    preflight
+    install_deps
+    ensure_yabai
+    ensure_borders
+    say "开启 dock-tools..."
+    "$DT" on
+    verify_sa
+    if [ "$wallpaper" = "1" ]; then
+        [ -x "$WHITE" ] || die "找不到 $WHITE"
+        "$WHITE" apply
+    fi
+    print_manual_steps
+}
+
+disable() {
+    [ -f "$DT" ] || die "找不到 $DT"
+    say "关闭 dock-tools 并恢复窗口阴影..."
+    "$DT" off
+    if [ -n "$BORDERS" ] && pgrep -x borders >/dev/null 2>&1; then
+        say "停止 JankyBorders..."
+        "$BREW" services stop FelixKratz/formulae/borders >/dev/null 2>&1 || true
+    fi
+    if [ -n "$YABAI" ] && pgrep -x yabai >/dev/null 2>&1; then
+        say "停止 yabai..."
+        "$YABAI" --stop-service >/dev/null 2>&1 || true
+    fi
+    say "已关闭。yabai/JankyBorders 仍装着，下次 on 直接启动。"
+    say "壁纸如换过，需在 系统设置 → 墙纸 手动选回。"
+}
+
+status() {
+    [ -f "$DT" ] && "$DT" status
+    say "--- 外观服务 ---"
+    if [ -n "$BREW" ]; then
+        say "yabai: $("$YABAI" --version 2>/dev/null || echo 未安装) / $(pgrep -x yabai >/dev/null 2>&1 && echo 运行中 || echo 未运行)"
+        local svc
+        svc=$("$BREW" services list 2>/dev/null | awk '$1=="borders"{print $2}')
+        say "JankyBorders: $("$BORDERS" --version 2>/dev/null || echo 未安装) / $([ -n "$svc" ] && echo "$svc" || echo 未安装)"
+    else
+        say "Homebrew: 未安装"
+    fi
+    say "yabai sudoers 规则: $([ -f "$SUDOERS" ] && echo 已安装 || echo 缺失)"
+    say "辅助功能授权: 只需 dock-helper 一个条目(脚本无法代查)"
+}
+
+uninstall() {
+    [ -f "$WS_UNINSTALL" ] || die "找不到 $WS_UNINSTALL"
+    disable
+    say "彻底卸载 yabai / JankyBorders(需要 sudo 密码)..."
+    "$WS_UNINSTALL"
+}
+
+cmd=on
+wallpaper=0
+for a in "$@"; do
+    case "$a" in
+        on|install|enable)   cmd=on ;;
+        off|disable|revert)  cmd=off ;;
+        status)              cmd=status ;;
+        uninstall|purge)     cmd=uninstall ;;
+        --wallpaper)         wallpaper=1 ;;
+        help|-h|--help)      usage; exit 0 ;;
+        *) usage >&2; exit 1 ;;
+    esac
+done
+
+case "$cmd" in
+    on)        enable "$wallpaper" ;;
+    off)       disable ;;
+    status)    status ;;
+    uninstall) uninstall ;;
+esac

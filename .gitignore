@@ -1,0 +1,32 @@
+# 编译产物（Mach-O 二进制）
+dock-helper
+menu-shade
+*.o
+*.dSYM/
+
+# 压缩包 / 镜像
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.dmg
+*.pkg
+
+# 归档 / 临时
+archive/
+.shots/
+*.nfs.*
+
+# 调试截图 / 临时观测器
+*.png
+.DS_Store
+._*
+
+# 系统 / IDE
+.idea/
+.vscode/
