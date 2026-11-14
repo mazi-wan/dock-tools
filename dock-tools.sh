@@ -172,16 +172,29 @@ conf_set() {
 }
 
 # 配置只在内容变化时重新解析。
-# 老实现每轮 6 个键各起一次 sed + tail（约 12 个进程），守护循环每 2 秒跑一遍，
+# 旧实现每轮 6 个键各起一次 sed + tail（约 12 个进程），守护循环每 2 秒跑一遍，
 # 这是守护脚本那 0.5% 的大头。现在用 zsh 内置的 $(<file) 读取（不起子进程），
 # 内容没变就直接返回；纯 zsh 解析，不再碰 sed。
 load_conf() {
     local content="" tag="missing" line key val
+    local -a st
     if [ -f "$CONF" ]; then
+        # mtime+size 先比：大多数轮次文件没动，zstat 是内置、不读文件、不 fork。
+        # zstat 的 +element 只能选一个，所以用 -H 取整张 hash。
+        local -A zst
+        if zstat -H zst -- "$CONF" 2>/dev/null; then
+            local stamp="${zst[mtime]}:${zst[size]}"
+            [ "$stamp" = "${_conf_stamp:-}" ] && return 0
+            _conf_stamp="$stamp"
+        fi
         content="$(<"$CONF")"
         tag="file"
+    else
+        [ "missing" = "${_conf_stamp:-}" ] && return 0
+        _conf_stamp="missing"
     fi
     local key_digest="$tag:${#content}:$content"
+    # 退化保护：mtime 一样但内容不一样（罕见，比如 cp 覆盖）→ 继续解析
     [ "$key_digest" = "${_conf_digest:-}" ] && return 0
     _conf_digest="$key_digest"
 

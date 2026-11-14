@@ -141,8 +141,10 @@ final class DockShade {
         guard on != alphaOn else { return }
         alphaOn = on
         window.alphaValue = on ? 1 : 0
-        // 常驻日志：偶发空白 Dock 时靠这条轨迹定位是面板没藏还是 Dock 没画
-        FileHandle.standardError.write("\(Date()) panel alpha=\(on ? 1 : 0)\n".data(using: .utf8)!)
+        // 常驻日志：偶发空白 Dock 时靠这条轨迹定位是面板没藏还是 Dock 没画。
+        // 每次切换都写盘：Dock 每 summon/收起一次就是一个 write syscall + 日志增长，
+        // 且笔屏悬停漂移时 Dock 会频繁召唤/收起，I/O 比 CPU 更先成为瓶颈。
+        if dbgOn { dbg("panel alpha=\(on ? 1 : 0)") }
     }
 
     private func place(_ rect: CGRect) {
