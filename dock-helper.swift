@@ -311,10 +311,16 @@ final class DockShade {
                           dockVisible: alphaOn || rising, settled: !rising)
         // 内阴影带的下沿：图标真正开始绘制的那一行（AX 图标矩形从 826 起，
         // 但那是命中区，实测第一行彩色像素在 841）。
-        // 下沿停在 838（settledTop 821 + 17）。各列实测：图标主体从 841/842 起，
-        // 但抗锯齿从 839 就有了（839 已经是 232/233，840 是 224）。
-        // 压到 839 会把那一行一起盖平，图标顶部看起来被削掉一条。
-        topFlattener?.sync(tube: settledTube, innerTop: settledTop + 17, flip: flip,
+        // 下沿停在 840（settledTop 821 + 20，含 840 这一行）。
+        //
+        // 这个数字是一行一行试出来的（+17/+18/+19/+20/+21 各跑一遍截图对比）：
+        //   +17、+18 → 838/839 整条暗 4 级，图标上方留一条浅横线
+        //   +19     → 839 好了，但 840 在图标位置是 225（图标抗锯齿被切）
+        //   +20     → 836..840 全部 237，图标从 841 的 16 开始，完整保留  ← 用这个
+        //   +21     → 把图标第一行（841）也盖掉
+        // 也就是说图标的抗锯齿实际从 841 才开始有可见像素，之前的暗行都是
+        // 压平层自己下边缘的半行抗锯齿。
+        topFlattener?.sync(tube: settledTube, innerTop: settledTop + 20, flip: flip,
                            dockVisible: alphaOn || rising)
     }
 }
