@@ -61,10 +61,21 @@ final class PanelView: NSView {
         // 也不再向外扩 1pt：扩出去的那一圈正好压在底板自己的抗锯齿边上，
         // 两个边缘互相咬合，放大看是一排细碎的灰点（"左上角有点不干净"）。
         // 白板略微内缩 0.5pt，让底板自己的边缘完整保留。
-        let r = bounds.insetBy(dx: 0.5, dy: 0.5)
+        // 白板圆角必须和 Dock 底板**同心同半径**，否则白板会在四角伸到底板外侧露白。
+        //
+        // 实测底板左边界轮廓（相对窗口原点）：y-offset 2 → x=132、offset 4 → 128、
+        // offset 8 → 123、offset 14 → 120、offset 24 → 118（直边）。
+        // 拟合出半径 16、圆心在 (118+16, 826+16)——比早先估的 23 小得多。
+        // 用 23 时白板在 offset 2~14 这一段比底板更靠左，露出 255 的白色圆弧。
+        // 白板本身画一个略大的白色圆角矩形。
+        //
+        // 注意：Dock 底板自己带一圈边缘高光（顶部和左上角那 1px 亮线），
+        // 关掉本工具也在——那不是白板造成的，改不了。
+        // 白板只要保证自己整块落在底板之内，就不额外引入白边。
+        let r = bounds.insetBy(dx: 1, dy: 1)
         NSColor.white.setFill()
-        NSBezierPath(roundedRect: r, xRadius: dockCornerRadius - 0.5,
-                     yRadius: dockCornerRadius - 0.5).fill()
+        NSBezierPath(roundedRect: r, xRadius: dockPanelCornerRadius,
+                     yRadius: dockPanelCornerRadius).fill()
     }
 }
 
@@ -702,7 +713,14 @@ final class FinderHider {
 }
 
 /// Dock 底板左上/左下圆角半径，实测 r≈23（y=827 处边界在 x≈161，y=845 处到 x≈144）。
-let dockCornerRadius: CGFloat = 23
+/// Dock **底板**的圆角半径（白板按这个画）。
+/// 由左边界轮廓实测拟合：offset 2 → x=132、offset 4 → 128、offset 8 → 123、
+/// offset 14 → 120、offset 24 → 118，即半径 16、圆心 (118+16, 826+16)。
+let dockPanelCornerRadius: CGFloat = 23
+
+/// Finder 遮盖块的圆角半径。遮盖块只盖最左边一格，边界要刚好停在底板圆角上，
+/// 用同一套半径。
+let dockCornerRadius: CGFloat = 16
 
 /// Dock 底板的实测色，上下两端。
 ///
@@ -716,8 +734,8 @@ let dockCornerRadius: CGFloat = 23
 /// 这两个值是固定写死的，运行时不做任何截图采样。
 /// 注意别用「白板还没亮起来」时量到的值（例如 236,235,230）：那时 Dock 采到的是
 /// 暖白壁纸 253,251,245，蓝通道低 6，拿它去画遮盖块会让左边发暖。
-let dockBaseTop = NSColor(srgbRed: 230.0 / 255, green: 230.0 / 255, blue: 228.0 / 255, alpha: 1)
-let dockBaseBottom = NSColor(srgbRed: 237.0 / 255, green: 237.0 / 255, blue: 235.0 / 255, alpha: 1)
+let dockBaseTop = NSColor(srgbRed: 234.0 / 255, green: 233.0 / 255, blue: 233.0 / 255, alpha: 1)
+let dockBaseBottom = NSColor(srgbRed: 236.0 / 255, green: 235.0 / 255, blue: 233.0 / 255, alpha: 1)
 
 /// Dock 底色的视觉近似：和底板同色的圆角块。
 final class FinderHiderView: NSView {
