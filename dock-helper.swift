@@ -242,7 +242,9 @@ final class DockShade {
 
     func update() {
         guard let flip = flippedY() else { return }
-        // Dock 重启（pid 变了）时旧白板可能盖在还没画好的 Dock 上，先藏掉重新校准
+        // Dock 重启（pid 变了）时旧白板可能盖在还没画好的 Dock 上，先藏掉重新校准。
+        // 这里查一次 pid 就够：dockTubeRect() 内部还会再查（它自己会缓存），
+        // 但那个调用只在 pid 变化时才多花一次 NSRunningApplication。
         let pid = dockPID()
         if pid != lastDockPID {
             lastDockPID = pid
@@ -659,6 +661,13 @@ final class DockTopFlattener {
 final class DockTopFlatView: NSView {
     override var isOpaque: Bool { false }
 
+    /// 渐变只建一次：draw 会随几何变化重跑，颜色是常量。
+    private lazy var gradient: NSGradient? = {
+        let top = NSColor(srgbRed: 237.0 / 255, green: 237.0 / 255, blue: 236.0 / 255, alpha: 1)
+        let bottom = NSColor(srgbRed: 237.0 / 255, green: 236.0 / 255, blue: 234.0 / 255, alpha: 1)
+        return NSGradient(starting: bottom, ending: top)
+    }()
+
     override func draw(_ dirtyRect: NSRect) {
         // 圆角只作用在**上边**两个角：这一条的下半截接着图标区，那里必须是直角
         // （图标区两侧是直的），下边画圆角会在中间凭空切出两个缺口。
@@ -680,13 +689,12 @@ final class DockTopFlatView: NSView {
         p.addLine(to: CGPoint(x: bounds.maxX, y: bounds.minY))
         p.closeSubpath()
 
-        NSGraphicsContext.current?.cgContext.saveGState()
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
         NSBezierPath(cgPath: p).addClip()
         // 顶端到底端有极轻的余留渐变（237 → 236），保证和下方图标区接得上。
-        let top = NSColor(srgbRed: 237.0 / 255, green: 237.0 / 255, blue: 236.0 / 255, alpha: 1)
-        let bottom = NSColor(srgbRed: 237.0 / 255, green: 236.0 / 255, blue: 234.0 / 255, alpha: 1)
-        NSGradient(starting: bottom, ending: top)?.draw(in: bounds, angle: 90)
-        NSGraphicsContext.current?.cgContext.restoreGState()
+        gradient?.draw(in: bounds, angle: 90)
     }
 }
 
@@ -879,6 +887,9 @@ let dockBaseBottom = NSColor(srgbRed: 236.0 / 255, green: 235.0 / 255, blue: 233
 final class FinderHiderView: NSView {
     override var isOpaque: Bool { false }
 
+    /// 渐变只建一次。draw 会在每次几何变化时重跑，而这两个颜色是常量。
+    private lazy var gradient = NSGradient(starting: dockBaseBottom, ending: dockBaseTop)
+
     override func draw(_ dirtyRect: NSRect) {
         // 左边两个角要跟底板一样圆：底板在屏幕左端是圆角，方块盖上去会在那儿多出一块灰。
         // 右边两角是直角——那条边落在两格图标之间的底色空隙里，同色相接看不出接缝。
@@ -894,10 +905,14 @@ final class FinderHiderView: NSView {
         path.addLine(to: CGPoint(x: bounds.maxX, y: bounds.minY))
         path.closeSubpath()
 
-        let clip = NSBezierPath(cgPath: path)
-        clip.addClip()
+        // 裁剪状态要自己收尾：addClip 改的是当前上下文的图形状态，
+        // 虽然 AppKit 每轮 draw 都会重置，但成对写更安全（也避免嵌套 draw 时串味）。
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        NSBezierPath(cgPath: path).addClip()
         // NSGradient 的起点参数是「下」、终点是「上」。底板顶端更暗（内阴影）、底端更亮。
-        NSGradient(starting: dockBaseBottom, ending: dockBaseTop)?.draw(in: bounds, angle: 90)
+        gradient?.draw(in: bounds, angle: 90)
     }
 }
 
