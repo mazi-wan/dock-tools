@@ -2,6 +2,42 @@
 
 记录 dock-tools 的优化历程和重要变更。README 只保留当前状态，历史细节放这里。
 
+## 新增：隐藏 Dock 上的 Finder（2026-11-15）
+
+需求：Dock 最左边是 Finder，想去掉它，改用 Strata。
+
+先确认了 Finder 删不掉：
+
+| 尝试 | 结果 |
+| --- | --- |
+| `persistent-apps` 里找 Finder | 不存在（12 项里第 0 项就是 Strata） |
+| `defaults write com.apple.dock static-only -bool true` | **无效**，只是把图标重排了一遍 |
+| 从 plist 删条目 | Finder 是 Dock 硬编码的，plist 里没有 |
+
+所以做成叠加层（`hide_finder`）：读 AX 找 Dock 里 Finder 那一格，贴一块白色方块。
+Finder 本身仍在，⌘N / 点桌面都照旧。
+
+### 两个坑
+
+1. **层级必须够高**：Dock 的图标是它自己画的、不是独立窗口。
+   实测 level 3/5/10 完全盖不住（Finder 区域蓝色像素 5055 → 601），
+   20 起干净，最终用 24（和菜单栏窗口同层，不会压住菜单栏）。
+2. **AX 的 Dock 矩形不反映实时状态**：Dock 收起后 `AXPosition` 仍返回落定位置 821，
+   不会变成 900；Finder 图标的矩形同样不动。所以「Dock 在不在屏上」不能靠 AX 判断，
+   改为借用面板模式已有的 `engaged` 信号（面板本来就知道 Dock 是否升起）。
+
+采样率自适应：Dock 在屏上 0.1 秒、收起 1 秒。Dock 收起时白板跟着隐藏。
+
+### 调试过程中的教训
+
+测试时多次误判，都是工具的问题而不是代码的问题：
+
+- 合成鼠标事件卡在 (800,899)，Dock 从未收起 → 误以为「收起时不隐藏」
+- 同时跑了两个 dock-helper 实例 → 测到别人的 CPU
+- 合成 hover 出来的 Dock 状态和真实鼠标不一致
+
+最后确认：展开时 Finder 区域蓝色像素 0/6000（完全遮住），收起时窗口 alpha=0。
+
 ## 移除 Finder 侧栏处理（2026-11-14）
 
 原来加过一个 `finder_sidebar` 开关，给 Finder 侧栏选中行贴半透明浅蓝底。

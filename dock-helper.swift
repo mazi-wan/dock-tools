@@ -2,6 +2,7 @@
 //   --panel=1   Dock 下方白色面板（原 dock-shade）
 //   --tap=1     App 启动器点击修正（原 apps-toggle）
 //   --menubar=1 菜单栏底色漂白 + 压掉底边那条深灰分隔线
+//   --nofinder=1 用白板盖住 Dock 最左边的 Finder 图标（Finder 本身仍在）
 // 两件事共用同一条辅助功能授权，系统设置里只需 dock-helper 一个条目。
 // 守护脚本按配置传参；参数变化时重启这一个进程，两个开关仍互不影响。
 //
@@ -326,6 +327,12 @@ var lastTapPermissionLog = Date.distantPast
 /// 只放在 runHelper 的局部变量里会在函数返回后被释放，tick 就停了。
 var panelDriver: Driver?
 
+/// 面板在跑时留一个引用，供 FinderHider 判断 Dock 是否在屏上。
+var panelShade: DockShade?
+
+/// 遮住 Dock 上的 Finder。Timer 用 weak self，必须强引用。
+var finderHider: FinderHider?
+
 
 func runHelper() {
     let app = NSApplication.shared
@@ -341,6 +348,9 @@ func runHelper() {
 
     if wantsPanel {
         let shade = DockShade()
+        // 遮住 Dock 上的 Finder：需要跟着 Dock 升降一起动，
+        // 所以复用面板那套跟踪循环，不自己起定时器。
+        panelShade = shade
         let driver = Driver(shade: shade)
         driver.start()
         // Driver 内部用 [weak self] 的 Timer，如果没有强引用会被立刻释放、tick 再也不跑。
@@ -386,6 +396,18 @@ func runHelper() {
 
         shade.update()
         print("\(Date()) dock-helper panel 已启动")
+        fflush(stdout)
+    }
+
+    if wantsNoFinder {
+        let hider = FinderHider()
+        // 面板模式知道 Dock 是否升起，直接借用；没开面板时退化成总是显示
+        if let shade = panelShade {
+            hider.dockOnScreen = { [weak shade] in shade?.engaged ?? true }
+        }
+        hider.start()
+        finderHider = hider     // 强引用
+        print("\(Date()) dock-helper nofinder 已启动")
         fflush(stdout)
     }
 
@@ -437,6 +459,171 @@ func axFrame(_ el: AXUIElement) -> CGRect? {
     AXValueGetValue(sv as! AXValue, .cgSize, &s)
     guard s.width > 0, s.height > 0 else { return nil }
     return CGRect(origin: p, size: s)
+}
+
+// MARK: - 隐藏 Dock 最左边的 Finder
+
+// Finder 是 macOS 硬编码在 Dock 第一位（subrole=AXApplicationDockItem，
+// url=/System/Library/CoreServices/Finder.app）。它不在 com.apple.dock.plist 的
+// persistent-apps 里，`defaults write com.apple.dock static-only -bool true` 也删不掉
+// （实测无效，只是让图标重新排了一遍）。
+//
+// 所以走叠加层：从 Dock 的 AX 列表里找到 Finder 那一格，在它上面贴一块
+// 和 Dock 底色一致的圆角白板。Finder 本身没被禁用，⌘N、点桌面都照旧。
+//
+// 成本：一次 AX 查询（0.02~0.05ms）。位置固定在落定位置，
+// 和 Dock 白板一样不跟随升降动画，所以只需要低频校正。
+
+final class FinderHider {
+    private let window: NSWindow
+    private var applied: CGRect?
+    private var lastDockPID: pid_t?
+    private var timer: Timer?
+
+    /// 由面板模式喂进来的「Dock 在不在屏上」。
+    /// AX 的 Dock 矩形不反映实时状态（收起时仍返回落定位置 821），
+    /// 而面板模式本来就知道 Dock 是否升起，直接借用最可靠。
+    /// 面板没开时退化成「总是显示」。
+    var dockOnScreen: (() -> Bool)?
+
+    init() {
+        window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 4, height: 4),
+                          styleMask: .borderless, backing: .buffered, defer: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.isMovable = false
+        window.isReleasedWhenClosed = false
+        // 层级必须够高：Dock 的图标是它自己画的，不是独立窗口。
+        // 实测 level 5/10 完全盖不住，20 起能盖住，24 干净
+        //（菜单栏窗口是 24，用同层但不抢它的位置；再高会压住菜单栏）。
+        window.level = NSWindow.Level(rawValue: 24)
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.contentView = FinderHiderView(frame: CGRect(x: 0, y: 0, width: 4, height: 4))
+        window.alphaValue = 0
+        window.orderFrontRegardless()
+    }
+
+    /// Dock 的 AX 位置会跟着升降变（升起 y≈826、收起 y≈905），所以要跟住它。
+    ///
+    /// 采样率按状态自适应，和 Dock 白板同一套思路：
+    ///   - Dock 在屏上（白板亮着）：0.1 秒，跟着升降不迟滞
+    ///   - Dock 收起：1 秒，只为发现它重新升起
+    /// 收起状态下的 1 秒一次是绝大部分时间，所以平均开销很低。
+    private var visible = false
+
+    func start() {
+        refresh()
+        schedule()
+    }
+
+    private func schedule() {
+        let iv: TimeInterval = visible ? 0.1 : 1.0
+        if let t = timer, t.timeInterval == iv { return }
+        timer?.invalidate()
+        let t = Timer(timeInterval: iv, repeats: true) { [weak self] _ in self?.refresh() }
+        t.tolerance = iv * 0.3
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    func refresh() {
+        guard let pid = dockPID() else { hide(); return }
+        if pid != lastDockPID { lastDockPID = pid; applied = nil }
+        guard let flip = screenFlip() else { hide(); return }
+        // AX 的 Dock 矩形不反映实时状态（收起后仍返回落定位置 821），
+        // 所以用面板模式喂进来的信号判断 Dock 是否真的在屏上。
+        if let probe = dockOnScreen, !probe() {
+            hide()
+            if visible { visible = false; schedule() }
+            return
+        }
+        guard let item = finderDockItemRect() else {
+            hide()
+            return
+        }
+        if !visible { visible = true; schedule() }
+        let target = coverRect(for: item, flip: flip)
+        if applied != target {
+            applied = target
+            window.setFrame(target, display: true)
+            window.orderFrontRegardless()
+            if window.alphaValue < 1 { window.alphaValue = 1 }
+        } else if window.alphaValue < 1 {
+            window.alphaValue = 1
+        }
+    }
+
+    private func screenFlip() -> CGFloat? {
+        guard let main = NSScreen.screens.first else { return nil }
+        return main.frame.origin.y + main.frame.height
+    }
+
+    private func hide() {
+        guard applied != nil || window.alphaValue > 0 else { return }
+        applied = nil
+        window.alphaValue = 0
+    }
+
+    /// AX 左上原点 → NSWindow 左下原点。白板比图标略大一圈，盖掉阴影边。
+    private func coverRect(for cg: CGRect, flip: CGFloat) -> CGRect {
+        // 图标本身 53pt 宽。左右各外扩 6pt 把 Dock 的内边距吃掉，
+        // 上面加 2pt 盖住图标的投影。这样整格被填满，不露蓝边。
+        let padX: CGFloat = 6
+        let padTop: CGFloat = 2
+        return CGRect(x: cg.minX - padX,
+                      y: flip - cg.maxY,
+                      width: cg.width + padX * 2,
+                      height: cg.height + padTop)
+    }
+}
+
+/// Dock 底色的视觉近似。Dock 是毛玻璃，在彩墨屏上被白板压成接近纯白，
+/// 这里用同色圆角块盖住，看起来就是"那个位置是空的"。
+final class FinderHiderView: NSView {
+    override var isOpaque: Bool { false }
+    override func draw(_ dirtyRect: NSRect) {
+        // 不画圆角：Dock 的底板本身就是方角，圆角会在拐角露出底色，
+        // 看着像"补了一块纸"。整块矩形铺满最稳。
+        NSColor.white.setFill()
+        bounds.fill()
+    }
+}
+
+/// 找到 Dock 里 Finder 那一格的矩形（CG 全局坐标，左上原点）。
+/// 直接遍历 Dock 的 AXList，取第一个 subrole 为 AXApplicationDockItem
+/// 且 URL 指向 Finder.app 的元素。
+private var cachedFinderItem: AXUIElement?
+private var cachedFinderItemPID: pid_t?
+
+func finderDockItemRect() -> CGRect? {
+    guard let pid = dockPID() else { return nil }
+    if cachedFinderItemPID != pid { cachedFinderItem = nil; cachedFinderItemPID = pid }
+    var items: [AXUIElement] = []
+    if let cached = cachedFinderItem {
+        items = [cached]
+    } else {
+        guard let tube = tubeElement(pid),
+              let all = axAttr(tube, kAXChildrenAttribute) as? [AXUIElement] else { return nil }
+        items = all
+    }
+    for it in items {
+        guard let url = axAttr(it, kAXURLAttribute) as? URL,
+              url.path.hasSuffix("Finder.app") else { continue }
+        cachedFinderItem = it
+        guard let pv = axAttr(it, kAXPositionAttribute),
+              let sv = axAttr(it, kAXSizeAttribute),
+              CFGetTypeID(pv) == AXValueGetTypeID(),
+              CFGetTypeID(sv) == AXValueGetTypeID() else { return nil }
+        var p = CGPoint.zero
+        var s = CGSize.zero
+        AXValueGetValue(pv as! AXValue, .cgPoint, &p)
+        AXValueGetValue(sv as! AXValue, .cgSize, &s)
+        guard s.width > 20, s.height > 20 else { return nil }
+        return CGRect(origin: p, size: s)
+    }
+    return nil
 }
 
 // MARK: - 菜单栏清理
@@ -967,7 +1154,7 @@ func startTapRetry() {
 }
 
 func usageAndExit(_ code: Int32) -> Never {
-    FileHandle.standardError.write("用法: dock-helper [--panel=0|1] [--tap=0|1] [--menubar=0|1]\n".data(using: .utf8)!)
+    FileHandle.standardError.write("用法: dock-helper [--panel=0|1] [--tap=0|1] [--menubar=0|1] [--nofinder=0|1]\n".data(using: .utf8)!)
     exit(code)
 }
 
@@ -975,6 +1162,7 @@ func usageAndExit(_ code: Int32) -> Never {
 var wantsPanel = CommandLine.arguments.count == 1
 var wantsTap = CommandLine.arguments.count == 1
 var wantsMenuBar = CommandLine.arguments.count == 1
+var wantsNoFinder = CommandLine.arguments.count == 1
 for arg in CommandLine.arguments.dropFirst() {
     switch arg {
     case "--panel=1": wantsPanel = true
@@ -983,11 +1171,13 @@ for arg in CommandLine.arguments.dropFirst() {
     case "--tap=0": wantsTap = false
     case "--menubar=1": wantsMenuBar = true
     case "--menubar=0": wantsMenuBar = false
+    case "--nofinder=1": wantsNoFinder = true
+    case "--nofinder=0": wantsNoFinder = false
     case "help", "-h", "--help": usageAndExit(0)
     default: usageAndExit(2)
     }
 }
 
-if wantsPanel || wantsTap || wantsMenuBar {
+if wantsPanel || wantsTap || wantsMenuBar || wantsNoFinder {
     runHelper()
 }

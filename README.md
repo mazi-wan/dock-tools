@@ -10,6 +10,7 @@
 | `remove_window_shadow` | 关掉所有普通窗口的阴影                           |
 | `apps_toggle`          | 启动器打开时再点 Dock 图标能正常关闭（macOS 26 的 bug） |
 | `menu_bar_line`        | 菜单栏漂成纯白，并压掉底边那条 1pt 深灰线               |
+| `hide_finder`          | 用白板盖住 Dock 最左边的 Finder 图标                    |
 
 配置文件 `~/.config/dock-tools/config.conf`，保存后约 2 秒生效。  
 程序本体从 `~/Library/Application Support/dock-tools/` 启动（launchd 读不了 NFS）；  
@@ -33,22 +34,42 @@ Dock 的材质从它取样，呈现为实色白。
 - Dock 的 AX 元素缓存住；另有 60 秒一次的慢速兜底
 - AX 查询 0.08 ms → 0.02 ms
 
-### 2. Chrome 菜单白底（`menu_white`）
+### 2. 隐藏 Dock 上的 Finder（`hide_finder`）
+
+Finder 是 macOS **硬编码在 Dock 第一位**的（`subrole=AXApplicationDockItem`，
+`url=/System/Library/CoreServices/Finder.app`），它不在 `com.apple.dock.plist` 的
+`persistent-apps` 里，`defaults write com.apple.dock static-only -bool true` 也删不掉
+（实测无效，只是把图标重排了一遍）。
+
+所以用叠加层：从 Dock 的 AX 列表里找到 Finder 那一格，在它上面贴一块白色方块。
+Finder 本身没被禁用，⌘N、点桌面都照旧。
+
+实现上有两个坑：
+
+1. **层级必须 24**。Dock 的图标是它自己画的、不是独立窗口，
+   level 3/5/10 完全盖不住（实测 Finder 区域蓝色像素 5055→601），20 起才干净。
+2. **AX 的 Dock 矩形不反映实时状态**：Dock 收起后 `AXPosition` 仍返回落定位置 821，
+   不会变成 900。所以「Dock 在不在屏上」借用面板模式已有的 `engaged` 信号，
+   面板没开时退化成总是显示。
+
+Dock 收起时白板跟着隐藏；采样率自适应（Dock 在屏上 0.1 秒、收起 1 秒）。
+
+### 3. Chrome 菜单白底（`menu_white`）
 
 Chrome 右键菜单（layer 101）也是毛玻璃。同样在它后面垫白色圆角板（level 3）。  
 菜单一关闭窗口就从 `CGWindowList` 里消失，据此收掉白板——**空闲时不跑定时器**。
 
-### 3. 去窗口阴影（`remove_window_shadow`）
+### 4. 去窗口阴影（`remove_window_shadow`）
 
 交给 yabai：`yabai -m config window_shadow off`。  
 守护循环只在 yabai 换 pid / 开关切换 / 60 秒时重发。
 
-### 4. 启动器点击修正（`apps_toggle`）
+### 5. 启动器点击修正（`apps_toggle`）
 
 macOS 26 里启动器（`com.apple.campo`）打开时，点 Dock 图标不会关闭它。  
 用 CGEvent tap 监听点击，命中 Dock 的「启动器」格子且启动器正开着时，补发一次 AX press。
 
-### 5. 菜单栏漂白（`menu_bar_line`）
+### 6. 菜单栏漂白（`menu_bar_line`）
 
 「降低透明度」开着时系统把菜单栏画成不透明灰（实测 sRGB 218），  
 并在底边压一条 1pt 深灰线（约 120）。彩墨屏上菜单栏和背景窗几乎同色。
@@ -77,7 +98,8 @@ AX 读不到里面的元素，所以没法「只重绘背景、保留图标」�
 | 菜单栏漂白（常驻 stream + 1fps 心跳）| 约 0.15%          | 位图约 1–2 MB    |
 | Dock 白板（2Hz 轮询，指针远离 Dock）  | 约 0.05%          | 约 10 MB       |
 | 启动器点击修正                     | 约 0.01%          | 约 7 MB        |
-| `dock-helper` 合计             | **约 0.12~0.2%** | 17~67 MB（见下） |
+| 隐藏 Finder（收起时 1Hz，屏上 0.1s） | 约 0.02%          | 约 1 MB        |
+| `dock-helper` 合计             | **约 0.2~0.45%** | 17~67 MB（见下） |
 | `menu-shade`                | 0%（无定时器）         | 约 60 MB       |
 | 守护脚本                        | **约 0.05%**      | 约 3 MB        |
 
