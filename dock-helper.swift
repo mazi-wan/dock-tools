@@ -212,7 +212,7 @@ final class DockShade {
             // 读不到 Dock 矩形（Dock 正在重启/AX 暂不可用）：藏掉白板，避免一条空白 bar
             setAlpha(false)
             rising = false
-            finderHider?.sync(tube: .zero, flip: flip, dockVisible: false)
+            finderHider?.sync(tube: .zero, flip: flip, dockVisible: false, settled: false)
             return
         }
         let settledTop = flip - cg.height - gap
@@ -236,9 +236,20 @@ final class DockShade {
             setAlpha(true)
         }
 
-        // 和白板同一帧、同一份 cg/flip 推进 Finder 遮盖，两者不会错帧。
+        // 和白板同一帧推进 Finder 遮盖。
+        //
+        // 注意这里传的是**落定位置**的 Dock 矩形，不是实时的 cg：
+        // AX 报的位置比屏幕实际渲染滞后约 150ms（实测升起动画里底板已经到 860，
+        // AX 还报 886），跟着它走遮罩就会慢半拍、让 Finder 露出来一大截。
+        // 遮罩盖的是一块固定的面积，Dock 最终一定会到落定位置，
+        // 所以直接按落点画——动画期间多盖的部分是白板/屏外，看不出来。
+        // 白板自己也是这么做的（见上面 rising 分支的注释）。
+        let settledTube = CGRect(x: cg.minX, y: settledTop,
+                                 width: cg.width, height: cg.height)
         // dockVisible 用白板自己的状态：它已经知道 Dock 是否在屏上。
-        finderHider?.sync(tube: cg, flip: flip, dockVisible: alphaOn || rising)
+        // settled：只有 Dock 真的停在落点时才让遮罩去读 AX 校准图标偏移。
+        finderHider?.sync(tube: settledTube, flip: flip,
+                          dockVisible: alphaOn || rising, settled: !rising)
     }
 }
 
@@ -494,12 +505,15 @@ final class FinderHider {
     /// 由面板模式喂进来的「Dock 在不在屏上」。
     var dockOnScreen: (() -> Bool)?
 
-    /// Finder 图标相对 Dock 条的偏移，只算一次（图标在条里的位置不变）。
-    /// 有了它就能用「实时 Dock 矩形」推出图标位置，跟着升/收动画同步移动，
-    /// 不必每帧查 AX。
-    private var offset: (dx: CGFloat, dy: CGFloat, w: CGFloat, h: CGFloat)?
-    private var offsetPID: pid_t?
-    private var offsetAt = Date.distantPast
+    /// Finder 图标的**绝对**矩形（CG 全局坐标），只在 Dock 落定时读 AX 更新。
+    ///
+    /// 不用「相对 Dock 条的偏移」：Dock 收起时 tube 在屏外（[118,900]），
+    /// 而 AX 给的图标坐标还是落定值（[125,826]），相减会得到 dy=+83，
+    /// 反推回去就把遮罩算到屏幕外（实测 y=-73）。
+    /// 图标在 Dock 里的落定位置是固定的，直接缓存绝对矩形最稳。
+    private var itemRect: CGRect?
+    private var itemPID: pid_t?
+    private var itemAt = Date.distantPast
 
     /// 面板没开时的退路：自己的低频定时器（不太准但能用）。
     private var timer: Timer?
@@ -534,17 +548,16 @@ final class FinderHider {
         timer = t
     }
 
-    /// 由 DockShade 的跟踪循环每帧调用：tube 是当前（可能正在动画中的）Dock 条矩形。
-    /// 这样遮盖和 Dock 白板用同一份几何、同一时刻，不会有可见延迟。
-    func sync(tube: CGRect, flip: CGFloat, dockVisible: Bool) {
+    /// 由 DockShade 的跟踪循环每帧调用。
+    ///
+    /// `tube` 必须是**落定位置**的 Dock 条矩形（不是动画中的实时位置）：
+    /// AX 报的位置比屏幕实际渲染滞后约 150ms，跟着它走遮罩会慢半拍、让 Finder 露出来。
+    /// `settled` 表示 Dock 此刻真的在落定位置——只有这时才去读 AX 算图标偏移，
+    /// 动画中读到的偏移会被算歪（实测会把遮罩算到屏幕外 y=-73）。
+    func sync(tube: CGRect, flip: CGFloat, dockVisible: Bool, settled: Bool) {
         guard dockVisible else { hide(); return }
-        guard let off = finderOffset(tube: tube) else { hide(); return }
+        guard let item = finderItem(settled: settled, flip: flip) else { hide(); return }
 
-        // 用实时 tube 推图标位置（AX 的图标坐标不跟动画走，只有落定位置）
-        let item = CGRect(x: tube.minX + off.dx,
-                          y: tube.minY + off.dy,
-                          width: off.w,
-                          height: off.h)
         let target = coverRect(for: item, flip: flip, dockLeft: tube.minX)
 
         if applied != target {
@@ -563,31 +576,29 @@ final class FinderHider {
         if let probe = dockOnScreen, !probe() { hide(); return }
         guard let tube = dockTubeRect() else { hide(); return }
         guard tube.minY < flip - 20 else { hide(); return }
-        if pid != lastDockPID { lastDockPID = pid; offset = nil }
-        sync(tube: tube, flip: flip, dockVisible: true)
+        if pid != lastDockPID { lastDockPID = pid; itemRect = nil }
+        sync(tube: tube, flip: flip, dockVisible: true, settled: true)
     }
 
-    /// 读一次 AX 算「图标相对 Dock 条」的偏移。图标在条里的相对位置不变，
-    /// 只在 Dock 换 pid、条尺寸变了、或每隔几秒复核一次。
-    private func finderOffset(tube: CGRect) -> (dx: CGFloat, dy: CGFloat, w: CGFloat, h: CGFloat)? {
+    /// 图标的绝对矩形（落定位置）。
+    ///
+    /// 只在 Dock 落定时读 AX，但**不无条件缓存**：Dock 收起时 AX 给的图标坐标
+    /// 也在屏外（实测 y=905），一旦缓存这个值，遮罩就会一直贴着屏外不动，
+    /// 看起来就是"完全没反应"。所以只在图标位于屏幕内、尺寸正常时才采信。
+    private func finderItem(settled: Bool, flip: CGFloat) -> CGRect? {
         let pid = dockPID()
         let now = Date()
-        if let off = offset, offsetPID == pid,
-           now.timeIntervalSince(offsetAt) < 5,
-           abs(off.h - tube.height) < 2 {
-            return off
+        let cachedValid = itemRect.map { $0.midY < flip - 20 } ?? false
+        if cachedValid, itemPID == pid, now.timeIntervalSince(itemAt) < 5 {
+            return itemRect
         }
-        guard let item = finderDockItemRect() else { return offset }
-        // 只在 Dock 处于落定位置时采信：动画中 AX 仍是落定值，差值会算歪
-        guard tube.height > 20, item.height > 20 else { return offset }
-        let off = (dx: item.minX - tube.minX,
-                   dy: item.minY - tube.minY,
-                   w: item.width,
-                   h: item.height)
-        offset = off
-        offsetPID = pid
-        offsetAt = now
-        return off
+        // 动画中 AX 的 tube 和图标坐标不同步，这时读到的东西不能当落定数据缓存。
+        guard settled, let r = finderDockItemRect(), r.width > 20, r.height > 20,
+              r.midY < flip - 20 else { return cachedValid ? itemRect : nil }
+        itemRect = r
+        itemPID = pid
+        itemAt = now
+        return r
     }
 
     private func screenFlip() -> CGFloat? {
