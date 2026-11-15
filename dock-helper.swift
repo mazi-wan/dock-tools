@@ -616,9 +616,18 @@ final class FinderHider {
 /// 这里用同色块盖住，看起来就是"那个位置是空的"。
 final class FinderHiderView: NSView {
     override var isOpaque: Bool { false }
+
+    /// 遮盖块的颜色。必须和 Dock 底板一致，不能用纯白。
+    ///
+    /// 实测：Dock 中间那层不是透明的——它自己画了一层不透明底板，
+    /// 稳定在 (236,236,236)。面板白板（level 3）只影响 Dock 最上面 3pt
+    /// 的毛玻璃边缘（253→255）和中段那点浮层，中间主体仍是 236。
+    /// 所以填 255 会比周围亮 19 级，看起来像贴了块白纸。
+    static let fillColor = NSColor(srgbRed: 236/255, green: 236/255, blue: 236/255, alpha: 1)
+
     override func draw(_ dirtyRect: NSRect) {
         // 不画圆角：Dock 的底板本身就是方角，圆角会在拐角露出底色。
-        NSColor.white.setFill()
+        FinderHiderView.fillColor.setFill()
         bounds.fill()
     }
 }
