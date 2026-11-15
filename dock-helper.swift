@@ -55,9 +55,16 @@ func requestAccessibility() {
 
 final class PanelView: NSView {
     override func draw(_ dirtyRect: NSRect) {
-        let r = bounds.insetBy(dx: -1, dy: -1)
+        // 圆角半径必须和 Dock 底板一致（实测 r≈23，见 dockCornerRadius）。
+        // 以前写 26，白板比底板"更圆"，左上/左下角就在底板外多出一小块白。
+        //
+        // 也不再向外扩 1pt：扩出去的那一圈正好压在底板自己的抗锯齿边上，
+        // 两个边缘互相咬合，放大看是一排细碎的灰点（"左上角有点不干净"）。
+        // 白板略微内缩 0.5pt，让底板自己的边缘完整保留。
+        let r = bounds.insetBy(dx: 0.5, dy: 0.5)
         NSColor.white.setFill()
-        NSBezierPath(roundedRect: r, xRadius: 26, yRadius: 26).fill()
+        NSBezierPath(roundedRect: r, xRadius: dockCornerRadius - 0.5,
+                     yRadius: dockCornerRadius - 0.5).fill()
     }
 }
 
@@ -192,9 +199,13 @@ final class DockShade {
     ///
     /// 竖向直接对齐实测的底板范围：顶 = 落定后的 Dock 顶 + 5，
     /// 底 = 屏幕底边往上让 5pt（底板到 895，屏幕 900）。
-    /// 横向仍用 AX 的 x/宽，只多给 2pt 把底板两侧的抗锯齿边也包进去。
+    ///
+    /// 横向同理，也要对齐底板而不是命中区：实测命中区 x=118 起，底板也是 118 起，
+    /// 但早期给了 2pt pad，白板就比底板宽出一圈，在左右两端的圆角外侧
+    /// 露出纯白（底色是壁纸 250,244,237，一眼能看出来）。
+    /// 所以横向用零 pad——白板只要盖住底板，宽出去的每一像素都会露白。
     private func panelRect(_ cg: CGRect, top: CGFloat, flip: CGFloat) -> CGRect {
-        let padX: CGFloat = 2
+        let padX: CGFloat = 0
         let topInset: CGFloat = 5      // 命中区顶边 → 底板顶边
         let bottomInset: CGFloat = 5   // 底板底边 → 屏幕底边
         // 先按「屏幕坐标」（左上原点）算出上下边，再翻成 AppKit 的左下原点：
@@ -695,14 +706,18 @@ let dockCornerRadius: CGFloat = 23
 
 /// Dock 底板的实测色，上下两端。
 ///
-/// 白板生效时 Dock 是中性灰，但**有很轻的竖直渐变**：顶端 237,237,236、底端 235,234,232。
-/// 横向则几乎没有变化（整条 140..1470 波动只有 1~2 级），所以只做竖直渐变。
+/// 白板生效时 Dock 是中性灰，但**有竖直渐变**（这是 Dock 材质自己的顶部内阴影，
+/// 不是壁纸透出来的）：顶端 230,230,228 → 底端 237,237,235，单调递增，相差 7 级。
+/// 实测（x=180 纯底色列，y 827..894）：230,231,232,233,234,235,236,237 一路爬上去。
+///
+/// 渐变方向搞反正是"上部看着有点透明"的根源：早期写成 顶237 → 底235，
+/// 结果 Dock 顶部本该更暗、遮盖块却更亮，交界一眼能看出来。
 ///
 /// 这两个值是固定写死的，运行时不做任何截图采样。
 /// 注意别用「白板还没亮起来」时量到的值（例如 236,235,230）：那时 Dock 采到的是
 /// 暖白壁纸 253,251,245，蓝通道低 6，拿它去画遮盖块会让左边发暖。
-let dockBaseTop = NSColor(srgbRed: 237.0 / 255, green: 237.0 / 255, blue: 236.0 / 255, alpha: 1)
-let dockBaseBottom = NSColor(srgbRed: 235.0 / 255, green: 234.0 / 255, blue: 232.0 / 255, alpha: 1)
+let dockBaseTop = NSColor(srgbRed: 230.0 / 255, green: 230.0 / 255, blue: 228.0 / 255, alpha: 1)
+let dockBaseBottom = NSColor(srgbRed: 237.0 / 255, green: 237.0 / 255, blue: 235.0 / 255, alpha: 1)
 
 /// Dock 底色的视觉近似：和底板同色的圆角块。
 final class FinderHiderView: NSView {
@@ -725,7 +740,7 @@ final class FinderHiderView: NSView {
 
         let clip = NSBezierPath(cgPath: path)
         clip.addClip()
-        // NSGradient 的起点参数是「下」、终点是「上」。底板顶端更亮、底端更暗。
+        // NSGradient 的起点参数是「下」、终点是「上」。底板顶端更暗（内阴影）、底端更亮。
         NSGradient(starting: dockBaseBottom, ending: dockBaseTop)?.draw(in: bounds, angle: 90)
     }
 }
