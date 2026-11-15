@@ -120,6 +120,8 @@ final class DockShade {
     private var alphaOn = false
     private var lastDockPID: pid_t?
     private var armedUntil = Date.distantPast   // 压过边缘后的保护期，等 AX 跟上
+    /// 上一帧 Dock 顶边，用来判断当前是升起还是收起。
+    private var lastCgMinY: CGFloat = .infinity
 
     /// 遮住 Dock 上的 Finder。挂在这里是为了和白板共用同一帧几何，完全同步。
     var finderHider: FinderHider?
@@ -182,10 +184,26 @@ final class DockShade {
         return f
     }
 
+    /// 白板矩形。
+    ///
+    /// 不能直接用 AX 的条矩形：AX 报的是 Dock 的**命中区**（展开时 821..890），
+    /// 而底板实际画在 826..895——命中区比底板整体高 5pt。
+    /// 早期版本按命中区放白板，顶边就从 Dock 上方露出一条纯白（实测 819..826 全白）。
+    ///
+    /// 竖向直接对齐实测的底板范围：顶 = 落定后的 Dock 顶 + 5，
+    /// 底 = 屏幕底边往上让 5pt（底板到 895，屏幕 900）。
+    /// 横向仍用 AX 的 x/宽，只多给 2pt 把底板两侧的抗锯齿边也包进去。
     private func panelRect(_ cg: CGRect, top: CGFloat, flip: CGFloat) -> CGRect {
-        let pad: CGFloat = 2
-        return CGRect(x: cg.minX - pad, y: flip - (top + cg.height) - pad,
-                      width: cg.width + pad * 2, height: cg.height + pad * 2)
+        let padX: CGFloat = 2
+        let topInset: CGFloat = 5      // 命中区顶边 → 底板顶边
+        let bottomInset: CGFloat = 5   // 底板底边 → 屏幕底边
+        // 先按「屏幕坐标」（左上原点）算出上下边，再翻成 AppKit 的左下原点：
+        // AppKit 的 y 是窗口底边，等于 flip - 屏幕下边。
+        let screenTop = top + topInset
+        let screenBottom = flip - bottomInset
+        let h = screenBottom - screenTop
+        return CGRect(x: cg.minX - padX, y: flip - screenBottom,
+                      width: cg.width + padX * 2, height: h)
     }
 
     // 指针压到下边缘：白板本来就停在落定位置（只是透明的），这里立刻点亮。
@@ -218,16 +236,30 @@ final class DockShade {
         let settledTop = flip - cg.height - gap
         // Dock 自动隐藏时矩形落在屏外
         if cg.minY >= flip - 1 {
-            // 收起：白板留在落定位置，等下次召唤直接点亮
+            // 收起：白板留在落定位置（下次召唤直接点亮，不用再搬窗口），并灭掉。
+            // 不灭的话底板已经滑走、白板还亮着，看着就是"白板消失有延迟"。
+            //
+            // armedUntil 里的例外：指针刚压到边缘时 summon() 会先点亮白板，
+            // 好让 Dock 升起的第一帧就采到白。但 AX 这时还报"已收起"，
+            // 这里不能再无脑灭掉——否则 summon 和 update 会以 120Hz 互相打架，
+            // 表现为每 250ms 闪一下（同时把 CPU 拉到 2%）。
             place(panelRect(cg, top: settledTop, flip: flip))
             rising = false
             setAlpha(Date() < armedUntil)
         } else if cg.minY > settledTop + 1 {
-            // 升/收动画中：白板就停在最终位置。跟着动画走必然慢半拍，
+            // 升/收动画中：白板停在最终位置。跟着动画走必然慢半拍，
             // Dock 顶边会先露出背景色，这正是要避免的那一闪。
             place(panelRect(cg, top: settledTop, flip: flip))
-            rising = true
-            setAlpha(true)
+            // 方向决定亮还是灭：升起时白板要提前亮（Dock 一升上来就该采到白），
+            // 收起时要立刻灭——底板正往下滑，露出来的是壁纸，
+            // 白板留在原地就是一块"比 Dock 晚消失"的白，看着就是延迟。
+            let goingDown = cg.minY > lastCgMinY + 0.5
+            rising = !goingDown
+            if goingDown {
+                setAlpha(false)
+            } else {
+                setAlpha(true)
+            }
         } else {
             // 展开到位：贴住实测矩形，顺手学一次 Dock 离屏幕底边的间距
             gap = flip - cg.maxY
@@ -248,6 +280,7 @@ final class DockShade {
                                  width: cg.width, height: cg.height)
         // dockVisible 用白板自己的状态：它已经知道 Dock 是否在屏上。
         // settled：只有 Dock 真的停在落点时才让遮罩去读 AX 校准图标偏移。
+        lastCgMinY = cg.minY
         finderHider?.sync(tube: settledTube, flip: flip,
                           dockVisible: alphaOn || rising, settled: !rising)
     }
@@ -260,6 +293,7 @@ final class Driver {
     private var wasHot = false
     private var atEdge = false
     private var interval: TimeInterval = 0
+    private var lastPointer = CGPoint(x: -1, y: -1)
     private let hotBand: CGFloat = 160   // 距屏幕底边这么多点以内算「靠近 Dock」
     private let edgeBand: CGFloat = 6    // 真正压到 Dock 触发区的高度
     private let nearBand: CGFloat = 250  // 进入这个范围就提高采样率，好在指针压边时第一时间发现
@@ -268,7 +302,14 @@ final class Driver {
     // 为什么不用 NSEvent 全局监听：实测监听"什么都不做"也要 0.27% 单核
     // （事件本身要从 Window Server 送进本进程），而 4Hz 轮询只要 0.03%。
     // 这台笔屏有悬停漂移，指针一直在发事件，等于监听成本永远付满。
-    private let trackInterval: TimeInterval = 1.0 / 120.0
+    // 三档采样率。
+    //
+    // 动画档只在 Dock 正在升/收、或指针压在触发区时用：这两段时间要跟住位置变化。
+    // 静止档给「Dock 已经在屏上、指针也停住了」用——这时 Dock 位置不变，
+    // 查 AX 纯属空转。实测这台屏只有 33Hz，静止时按 120Hz 轮询只能把 CPU 从
+    // 0.6% 拉到 1.9%，画面一点不变。
+    private let animInterval: TimeInterval = 1.0 / 120.0
+    private let trackInterval: TimeInterval = 1.0 / 30.0
     private let nearInterval: TimeInterval = 1.0 / 30.0
     private let idleInterval: TimeInterval = 1.0 / 2.0
 
@@ -301,6 +342,9 @@ final class Driver {
 
     private func tick() {
         let p = NSEvent.mouseLocation   // 左下原点
+        // 指针是否移动过：停在原地的悬停不该持续续期高频跟踪。
+        let moved = p != lastPointer
+        lastPointer = p
         let screen = NSScreen.screens.first { $0.frame.contains(p) } ?? NSScreen.screens.first
         guard let screen else { schedule(idleInterval); return }
         let d = p.y - screen.frame.minY
@@ -318,20 +362,32 @@ final class Driver {
         // Dock 正在屏上/正在进出时才需要搬窗口；纯悬停不碰它
         if shade.engaged {
             if hot {
+                // 只在指针**真的动了**才续期。否则指针停在 Dock 上不动时，
+                // 每帧都续 0.35 秒，animating 永远为真，就一直按 120Hz 空转
+                // （实测这会把 CPU 从 0.6% 拉到 2%）。
+                if moved { holdUntil = now.addingTimeInterval(0.35) }
                 wasHot = true
-                holdUntil = now.addingTimeInterval(0.8)
             } else if wasHot {
                 wasHot = false
-                holdUntil = now.addingTimeInterval(0.8)   // 指针离开后 Dock 还要播收起动画
+                // 指针离开后 Dock 还要播收起动画。实测整段约 210ms，
+                // 这里给 350ms 留余量；早期写 0.8 秒，多出来的半秒全在 120Hz 空转。
+                holdUntil = now.addingTimeInterval(0.35)
             }
         } else {
             wasHot = hot
         }
 
-        let tracking = atEdge || shade.engaged || now < holdUntil
+        // 采样率分两档：
+        //   120Hz — 只在 Dock 真的在升/收的那一小段（rising 或刚离开后的 holdUntil）。
+        //           这段时间位置每帧都变，跟不上就会露出壁纸/漏出 Finder。
+        //   30Hz  — 其余所有需要跟踪的时间，包括指针压着触发区、Dock 稳定在屏上。
+        //           这台屏本身只有 33Hz，30Hz 已经够用；实测按 120Hz 空转
+        //           会把 CPU 从 0.6% 拉到 2%，画面毫无区别。
+        let animating = shade.rising || now < holdUntil
+        let tracking = atEdge || animating || shade.engaged
         if tracking {
             shade.update()
-            schedule(trackInterval)
+            schedule(animating ? animInterval : trackInterval)
         } else if d < nearBand {
             schedule(nearInterval)
         } else {
@@ -582,9 +638,13 @@ final class FinderHider {
 
     /// 图标的绝对矩形（落定位置）。
     ///
-    /// 只在 Dock 落定时读 AX，但**不无条件缓存**：Dock 收起时 AX 给的图标坐标
-    /// 也在屏外（实测 y=905），一旦缓存这个值，遮罩就会一直贴着屏外不动，
-    /// 看起来就是"完全没反应"。所以只在图标位于屏幕内、尺寸正常时才采信。
+    /// **不无条件缓存**：Dock 收起时 AX 给的图标坐标也在屏外（实测 y=905），
+    /// 一旦缓存这个值，遮罩就会一直贴着屏外不动，看起来就是"完全没反应"。
+    /// 所以只在图标位于屏幕内、尺寸正常时才采信。
+    ///
+    /// 也不能只在 settled 时读：进程刚启动、或 Dock 一直收着时永远等不到 settled，
+    /// 遮罩就会停在 4x4 初始尺寸上从没校准过。所以每帧都试读，
+    /// 只是把"动画期间读到的"丢掉（`settled` 只用来决定读取时机是否可信）。
     private func finderItem(settled: Bool, flip: CGFloat) -> CGRect? {
         let pid = dockPID()
         let now = Date()
@@ -592,8 +652,9 @@ final class FinderHider {
         if cachedValid, itemPID == pid, now.timeIntervalSince(itemAt) < 5 {
             return itemRect
         }
-        // 动画中 AX 的 tube 和图标坐标不同步，这时读到的东西不能当落定数据缓存。
-        guard settled, let r = finderDockItemRect(), r.width > 20, r.height > 20,
+        // 动画中 AX 的 tube 在动、图标还是落定值，这两者不同步，读到的不能当落定数据。
+        guard settled else { return cachedValid ? itemRect : nil }
+        guard let r = finderDockItemRect(), r.width > 20, r.height > 20,
               r.midY < flip - 20 else { return cachedValid ? itemRect : nil }
         itemRect = r
         itemPID = pid
