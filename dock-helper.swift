@@ -124,9 +124,6 @@ final class DockShade {
     /// 遮住 Dock 上的 Finder。挂在这里是为了和白板共用同一帧几何，完全同步。
     var finderHider: FinderHider?
 
-    /// Dock 漂白层：同样挂在这里，和白板共用同一份几何。
-    var dockWhitener: DockWhitener?
-
     init() {
         window = NSWindow(contentRect: .zero, styleMask: .borderless,
                           backing: .buffered, defer: false)
@@ -216,7 +213,6 @@ final class DockShade {
             setAlpha(false)
             rising = false
             finderHider?.sync(tube: .zero, flip: flip, dockVisible: false)
-            dockWhitener?.sync(tube: .zero, flip: flip, dockVisible: false)
             return
         }
         let settledTop = flip - cg.height - gap
@@ -243,7 +239,6 @@ final class DockShade {
         // 和白板同一帧、同一份 cg/flip 推进 Finder 遮盖，两者不会错帧。
         // dockVisible 用白板自己的状态：它已经知道 Dock 是否在屏上。
         finderHider?.sync(tube: cg, flip: flip, dockVisible: alphaOn || rising)
-        dockWhitener?.sync(tube: cg, flip: flip, dockVisible: alphaOn || rising)
     }
 }
 
@@ -345,8 +340,6 @@ var panelShade: DockShade?
 
 /// 遮住 Dock 上的 Finder。Timer 用 weak self，必须强引用。
 var finderHider: FinderHider?
-/// Dock 漂白层。同样要强引用。
-var dockWhitener: DockWhitener?
 
 
 func runHelper() {
@@ -414,32 +407,7 @@ func runHelper() {
         fflush(stdout)
     }
 
-    if wantsDockWhite {
-        let white = DockWhitener()
-        if let shade = panelShade {
-            // 面板在跑：由它的 120Hz 跟踪循环驱动，位置和白板完全一致
-            shade.dockWhitener = white
-            white.start(drivenByPanel: true)
-        } else {
-            white.start(drivenByPanel: false)
-        }
-        dockWhitener = white      // 强引用
-        let wsn = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.screensDidSleepNotification, NSWorkspace.willSleepNotification] {
-            wsn.addObserver(forName: name, object: nil, queue: .main) { _ in white.suspend() }
-        }
-        for name in [NSWorkspace.screensDidWakeNotification, NSWorkspace.didWakeNotification] {
-            wsn.addObserver(forName: name, object: nil, queue: .main) { _ in white.resume() }
-        }
-        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
-                                               object: nil, queue: .main) { _ in white.restart() }
-        print("\(Date()) dock-helper dockwhite 已启动（\(panelShade != nil ? "同步于 Dock 白板" : "独立轮询")）")
-        fflush(stdout)
-    }
-
     if wantsNoFinder {
-        // Dock 整条都被漂成纯白了，这一格也要纯白，不然是一块灰
-        if wantsDockWhite { FinderHiderView.fillColor = .white }
         let hider = FinderHider()
         if let shade = panelShade {
             // 面板在跑：由它的 120Hz 跟踪循环驱动，和 Dock 白板同帧
@@ -546,9 +514,8 @@ final class FinderHider {
         window.isReleasedWhenClosed = false
         // 层级必须够高：Dock 的图标是它自己画的，不是独立窗口。
         // 实测 level 3/5/10 完全盖不住（Finder 区域蓝色像素 5055→601），
-        // 20 起才干净。用 25：Dock 漂白层在 24，这一格必须是白的，
-        // 得压在漂白层上面（菜单栏也在 25，但一个在屏幕顶、一个在底，不冲突）。
-        window.level = NSWindow.Level(rawValue: 25)
+        // 20 起才干净。用 24（和菜单栏窗口同层，但不会压住菜单栏）。
+        window.level = NSWindow.Level(rawValue: 24)
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.contentView = FinderHiderView(frame: CGRect(x: 0, y: 0, width: 4, height: 4))
         window.alphaValue = 0
@@ -577,7 +544,7 @@ final class FinderHider {
                           y: tube.minY + off.dy,
                           width: off.w,
                           height: off.h)
-        let target = coverRect(for: item, tube: tube, flip: flip)
+        let target = coverRect(for: item, flip: flip)
         if applied != target {
             applied = target
             window.setFrame(target, display: true)
@@ -632,20 +599,16 @@ final class FinderHider {
         window.alphaValue = 0
     }
 
-    /// AX 左上原点 → NSWindow 左下原点。
-    ///
-    /// 竖直方向**必须对齐 Dock 白板**（tube 上下各 2pt），不能用图标自己的矩形：
-    /// AX 给的图标是 `(152,826,53,69)`，而 Dock 条是 `(144,821,1312,69)`——
-    /// 高度一样但整体低了 5pt，直接拿来铺会一直铺到 895，
-    /// 比 Dock 底板的下沿还多出一截（左右两边看着一高一低）。
-    private func coverRect(for cg: CGRect, tube: CGRect, flip: CGFloat) -> CGRect {
-        // 图标本身约 53pt 宽。左右各外扩 6pt 把 Dock 的内边距吃掉。
+    /// AX 左上原点 → NSWindow 左下原点。白板比图标略大一圈，盖掉阴影边。
+    private func coverRect(for cg: CGRect, flip: CGFloat) -> CGRect {
+        // 图标本身约 53pt 宽。左右各外扩 6pt 把 Dock 的内边距吃掉，
+        // 上面加 2pt 盖住图标的投影。
         let padX: CGFloat = 6
-        let pad: CGFloat = 2
+        let padTop: CGFloat = 2
         return CGRect(x: cg.minX - padX,
-                      y: flip - tube.maxY - pad,
+                      y: flip - cg.maxY,
                       width: cg.width + padX * 2,
-                      height: tube.height + pad * 2)
+                      height: cg.height + padTop)
     }
 }
 
@@ -653,33 +616,10 @@ final class FinderHider {
 /// 这里用同色块盖住，看起来就是"那个位置是空的"。
 final class FinderHiderView: NSView {
     override var isOpaque: Bool { false }
-
-    /// 遮盖块的底色。必须和 Dock 底板一致，不能用纯白。
-    ///
-    /// 实测：Dock 中间那层不是透明的——它自己画了一层不透明底板，
-    /// 稳定在 (236,236,236)。面板白板（level 3）只影响 Dock 最上面 6pt
-    /// 的毛玻璃边缘（253→255）和中段那点浮层，中间主体仍是 236。
-    /// 所以填 255 会比周围亮 19 级，看起来像贴了块白纸。
-    ///
-    /// 想试别的值：`FINDER_SHADE=255 ./dock-helper ...`
-    static var fillColor: NSColor = {
-        let v = Int(ProcessInfo.processInfo.environment["FINDER_SHADE"] ?? "") ?? 236
-        let c = CGFloat(max(0, min(255, v))) / 255
-        return NSColor(srgbRed: c, green: c, blue: c, alpha: 1)
-    }()
-
-    /// Dock 顶边那圈玻璃在面板白板下是纯白，约 6pt。
-    /// 不照抄这段的话，遮盖块的上边缘会比 Dock 其它位置更早变灰，
-    /// 看上去就是「左边这一块比右边高了一点」。
-    private static let rimHeight: CGFloat = 6
-
     override func draw(_ dirtyRect: NSRect) {
         // 不画圆角：Dock 的底板本身就是方角，圆角会在拐角露出底色。
-        FinderHiderView.fillColor.setFill()
-        bounds.fill()
         NSColor.white.setFill()
-        NSRect(x: 0, y: bounds.maxY - FinderHiderView.rimHeight,
-               width: bounds.width, height: FinderHiderView.rimHeight).fill()
+        bounds.fill()
     }
 }
 /// 找到 Dock 里 Finder 那一格的矩形（CG 全局坐标，左上原点）。
@@ -1245,6 +1185,30 @@ func startTapRetry() {
 }
 
 func usageAndExit(_ code: Int32) -> Never {
-    FileHandle.standardError.write("用法: dock-helper [--panel=0|1] [--tap=0|1] [--menubar=0|1] [--nofinder=0|1] [--dockwhite=0|1]\n".data(using: .utf8)!)
+    FileHandle.standardError.write("用法: dock-helper [--panel=0|1] [--tap=0|1] [--menubar=0|1] [--nofinder=0|1]\n".data(using: .utf8)!)
     exit(code)
+}
+
+// 不带参数时两个功能都开，方便手动调试；守护脚本总是显式传两个开关
+var wantsPanel = CommandLine.arguments.count == 1
+var wantsTap = CommandLine.arguments.count == 1
+var wantsMenuBar = CommandLine.arguments.count == 1
+var wantsNoFinder = CommandLine.arguments.count == 1
+for arg in CommandLine.arguments.dropFirst() {
+    switch arg {
+    case "--panel=1": wantsPanel = true
+    case "--panel=0": wantsPanel = false
+    case "--tap=1": wantsTap = true
+    case "--tap=0": wantsTap = false
+    case "--menubar=1": wantsMenuBar = true
+    case "--menubar=0": wantsMenuBar = false
+    case "--nofinder=1": wantsNoFinder = true
+    case "--nofinder=0": wantsNoFinder = false
+    case "help", "-h", "--help": usageAndExit(0)
+    default: usageAndExit(2)
+    }
+}
+
+if wantsPanel || wantsTap || wantsMenuBar || wantsNoFinder {
+    runHelper()
 }

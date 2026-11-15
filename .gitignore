@@ -30,7 +30,3 @@ archive/
 # 系统 / IDE
 .idea/
 .vscode/
-
-# 临时测试二进制
-w
-w.swift
