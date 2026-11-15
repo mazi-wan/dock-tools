@@ -121,6 +121,9 @@ final class DockShade {
     private var lastDockPID: pid_t?
     private var armedUntil = Date.distantPast   // 压过边缘后的保护期，等 AX 跟上
 
+    /// 遮住 Dock 上的 Finder。挂在这里是为了和白板共用同一帧几何，完全同步。
+    var finderHider: FinderHider?
+
     init() {
         window = NSWindow(contentRect: .zero, styleMask: .borderless,
                           backing: .buffered, defer: false)
@@ -209,6 +212,7 @@ final class DockShade {
             // 读不到 Dock 矩形（Dock 正在重启/AX 暂不可用）：藏掉白板，避免一条空白 bar
             setAlpha(false)
             rising = false
+            finderHider?.sync(tube: .zero, flip: flip, dockVisible: false)
             return
         }
         let settledTop = flip - cg.height - gap
@@ -231,6 +235,10 @@ final class DockShade {
             rising = false
             setAlpha(true)
         }
+
+        // 和白板同一帧、同一份 cg/flip 推进 Finder 遮盖，两者不会错帧。
+        // dockVisible 用白板自己的状态：它已经知道 Dock 是否在屏上。
+        finderHider?.sync(tube: cg, flip: flip, dockVisible: alphaOn || rising)
     }
 }
 
@@ -401,13 +409,16 @@ func runHelper() {
 
     if wantsNoFinder {
         let hider = FinderHider()
-        // 面板模式知道 Dock 是否升起，直接借用；没开面板时退化成总是显示
         if let shade = panelShade {
-            hider.dockOnScreen = { [weak shade] in shade?.engaged ?? true }
+            // 面板在跑：由它的 120Hz 跟踪循环驱动，和 Dock 白板同帧
+            shade.finderHider = hider
+            hider.start(drivenByPanel: true)
+        } else {
+            // 面板没开：自己 0.1 秒查一次（精度差一些，但至少能盖住）
+            hider.start(drivenByPanel: false)
         }
-        hider.start()
         finderHider = hider     // 强引用
-        print("\(Date()) dock-helper nofinder 已启动")
+        print("\(Date()) dock-helper nofinder 已启动（\(panelShade != nil ? "同步于 Dock 白板" : "独立轮询")）")
         fflush(stdout)
     }
 
@@ -478,13 +489,19 @@ final class FinderHider {
     private let window: NSWindow
     private var applied: CGRect?
     private var lastDockPID: pid_t?
-    private var timer: Timer?
 
     /// 由面板模式喂进来的「Dock 在不在屏上」。
-    /// AX 的 Dock 矩形不反映实时状态（收起时仍返回落定位置 821），
-    /// 而面板模式本来就知道 Dock 是否升起，直接借用最可靠。
-    /// 面板没开时退化成「总是显示」。
     var dockOnScreen: (() -> Bool)?
+
+    /// Finder 图标相对 Dock 条的偏移，只算一次（图标在条里的位置不变）。
+    /// 有了它就能用「实时 Dock 矩形」推出图标位置，跟着升/收动画同步移动，
+    /// 不必每帧查 AX。
+    private var offset: (dx: CGFloat, dy: CGFloat, w: CGFloat, h: CGFloat)?
+    private var offsetPID: pid_t?
+    private var offsetAt = Date.distantPast
+
+    /// 面板没开时的退路：自己的低频定时器（不太准但能用）。
+    private var timer: Timer?
 
     init() {
         window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 4, height: 4),
@@ -496,8 +513,8 @@ final class FinderHider {
         window.isMovable = false
         window.isReleasedWhenClosed = false
         // 层级必须够高：Dock 的图标是它自己画的，不是独立窗口。
-        // 实测 level 5/10 完全盖不住，20 起能盖住，24 干净
-        //（菜单栏窗口是 24，用同层但不抢它的位置；再高会压住菜单栏）。
+        // 实测 level 3/5/10 完全盖不住（Finder 区域蓝色像素 5055→601），
+        // 20 起才干净。用 24（和菜单栏窗口同层，但不会压住菜单栏）。
         window.level = NSWindow.Level(rawValue: 24)
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.contentView = FinderHiderView(frame: CGRect(x: 0, y: 0, width: 4, height: 4))
@@ -505,45 +522,28 @@ final class FinderHider {
         window.orderFrontRegardless()
     }
 
-    /// Dock 的 AX 位置会跟着升降变（升起 y≈826、收起 y≈905），所以要跟住它。
-    ///
-    /// 采样率按状态自适应，和 Dock 白板同一套思路：
-    ///   - Dock 在屏上（白板亮着）：0.1 秒，跟着升降不迟滞
-    ///   - Dock 收起：1 秒，只为发现它重新升起
-    /// 收起状态下的 1 秒一次是绝大部分时间，所以平均开销很低。
-    private var visible = false
-
-    func start() {
+    /// 面板在跑时由它驱动（120Hz，和 Dock 白板完全同步）。
+    /// 面板没开则退回 0.1 秒自查。
+    func start(drivenByPanel: Bool) {
+        if drivenByPanel { return }
         refresh()
-        schedule()
-    }
-
-    private func schedule() {
-        let iv: TimeInterval = visible ? 0.1 : 1.0
-        if let t = timer, t.timeInterval == iv { return }
-        timer?.invalidate()
-        let t = Timer(timeInterval: iv, repeats: true) { [weak self] _ in self?.refresh() }
-        t.tolerance = iv * 0.3
+        let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.refresh() }
+        t.tolerance = 0.03
         RunLoop.main.add(t, forMode: .common)
         timer = t
     }
 
-    func refresh() {
-        guard let pid = dockPID() else { hide(); return }
-        if pid != lastDockPID { lastDockPID = pid; applied = nil }
-        guard let flip = screenFlip() else { hide(); return }
-        // AX 的 Dock 矩形不反映实时状态（收起后仍返回落定位置 821），
-        // 所以用面板模式喂进来的信号判断 Dock 是否真的在屏上。
-        if let probe = dockOnScreen, !probe() {
-            hide()
-            if visible { visible = false; schedule() }
-            return
-        }
-        guard let item = finderDockItemRect() else {
-            hide()
-            return
-        }
-        if !visible { visible = true; schedule() }
+    /// 由 DockShade 的跟踪循环每帧调用：tube 是当前（可能正在动画中的）Dock 条矩形。
+    /// 这样遮盖和 Dock 白板用同一份几何、同一时刻，不会有可见延迟。
+    func sync(tube: CGRect, flip: CGFloat, dockVisible: Bool) {
+        guard dockVisible else { hide(); return }
+        guard let off = finderOffset(tube: tube) else { hide(); return }
+
+        // 用实时 tube 推图标位置（AX 的图标坐标不跟动画走，只有落定位置）
+        let item = CGRect(x: tube.minX + off.dx,
+                          y: tube.minY + off.dy,
+                          width: off.w,
+                          height: off.h)
         let target = coverRect(for: item, flip: flip)
         if applied != target {
             applied = target
@@ -553,6 +553,39 @@ final class FinderHider {
         } else if window.alphaValue < 1 {
             window.alphaValue = 1
         }
+    }
+
+    /// 面板没开时的自驱路径。
+    func refresh() {
+        guard let pid = dockPID(), let flip = screenFlip() else { hide(); return }
+        if let probe = dockOnScreen, !probe() { hide(); return }
+        guard let tube = dockTubeRect() else { hide(); return }
+        guard tube.minY < flip - 20 else { hide(); return }
+        if pid != lastDockPID { lastDockPID = pid; offset = nil }
+        sync(tube: tube, flip: flip, dockVisible: true)
+    }
+
+    /// 读一次 AX 算「图标相对 Dock 条」的偏移。图标在条里的相对位置不变，
+    /// 只在 Dock 换 pid、条尺寸变了、或每隔几秒复核一次。
+    private func finderOffset(tube: CGRect) -> (dx: CGFloat, dy: CGFloat, w: CGFloat, h: CGFloat)? {
+        let pid = dockPID()
+        let now = Date()
+        if let off = offset, offsetPID == pid,
+           now.timeIntervalSince(offsetAt) < 5,
+           abs(off.h - tube.height) < 2 {
+            return off
+        }
+        guard let item = finderDockItemRect() else { return offset }
+        // 只在 Dock 处于落定位置时采信：动画中 AX 仍是落定值，差值会算歪
+        guard tube.height > 20, item.height > 20 else { return offset }
+        let off = (dx: item.minX - tube.minX,
+                   dy: item.minY - tube.minY,
+                   w: item.width,
+                   h: item.height)
+        offset = off
+        offsetPID = pid
+        offsetAt = now
+        return off
     }
 
     private func screenFlip() -> CGFloat? {
@@ -568,8 +601,8 @@ final class FinderHider {
 
     /// AX 左上原点 → NSWindow 左下原点。白板比图标略大一圈，盖掉阴影边。
     private func coverRect(for cg: CGRect, flip: CGFloat) -> CGRect {
-        // 图标本身 53pt 宽。左右各外扩 6pt 把 Dock 的内边距吃掉，
-        // 上面加 2pt 盖住图标的投影。这样整格被填满，不露蓝边。
+        // 图标本身约 53pt 宽。左右各外扩 6pt 把 Dock 的内边距吃掉，
+        // 上面加 2pt 盖住图标的投影。
         let padX: CGFloat = 6
         let padTop: CGFloat = 2
         return CGRect(x: cg.minX - padX,
@@ -580,17 +613,15 @@ final class FinderHider {
 }
 
 /// Dock 底色的视觉近似。Dock 是毛玻璃，在彩墨屏上被白板压成接近纯白，
-/// 这里用同色圆角块盖住，看起来就是"那个位置是空的"。
+/// 这里用同色块盖住，看起来就是"那个位置是空的"。
 final class FinderHiderView: NSView {
     override var isOpaque: Bool { false }
     override func draw(_ dirtyRect: NSRect) {
-        // 不画圆角：Dock 的底板本身就是方角，圆角会在拐角露出底色，
-        // 看着像"补了一块纸"。整块矩形铺满最稳。
+        // 不画圆角：Dock 的底板本身就是方角，圆角会在拐角露出底色。
         NSColor.white.setFill()
         bounds.fill()
     }
 }
-
 /// 找到 Dock 里 Finder 那一格的矩形（CG 全局坐标，左上原点）。
 /// 直接遍历 Dock 的 AXList，取第一个 subrole 为 AXApplicationDockItem
 /// 且 URL 指向 Finder.app 的元素。
