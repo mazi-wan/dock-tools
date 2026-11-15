@@ -490,6 +490,11 @@ final class FinderHider {
     private var applied: CGRect?
     private var lastDockPID: pid_t?
 
+    /// 底板真实底色。量到之前先用退路值，量到之后换成实测值。
+    private var colors = DockBaseColors.fallback
+    private var sampling = false
+    private var sampledFor: CGRect?
+
     /// 由面板模式喂进来的「Dock 在不在屏上」。
     var dockOnScreen: (() -> Bool)?
 
@@ -544,7 +549,28 @@ final class FinderHider {
                           y: tube.minY + off.dy,
                           width: off.w,
                           height: off.h)
-        let target = coverRect(for: item, flip: flip)
+        let target = coverRect(for: item, flip: flip, dockLeft: tube.minX)
+
+        // 底色必须凭空量：采样时跳过自己盖住的那一段，只量右边露出来的底板。
+        // 底板横向是均匀的，跳过这几格不影响结果，好处是不用先把窗口藏起来（藏了会闪一下 Finder）。
+        // 只在 Dock 条几何变了时重量一次（条尺寸变了底色渐变长度也变了）。
+        let key = CGRect(x: tube.minX.rounded(), y: item.minY.rounded(),
+                         width: tube.width.rounded(), height: item.height.rounded())
+        if sampledFor != key, !sampling {
+            sampling = true
+            let band = CGRect(x: tube.minX, y: item.minY + 1,
+                              width: tube.width, height: item.height - 2)
+            // 遮盖块自己那一段（左右各多让 4pt，避开块边缘的抗锯齿）
+            let skip = (target.minX - 4)...(target.maxX + 4)
+            DockBaseSampler.sample(band: band, skip: skip) { [weak self] c in
+                guard let self else { return }
+                self.colors = c
+                self.sampledFor = key
+                self.sampling = false
+                (self.window.contentView as? FinderHiderView)?.colors = c
+            }
+        }
+
         if applied != target {
             applied = target
             window.setFrame(target, display: true)
@@ -561,7 +587,7 @@ final class FinderHider {
         if let probe = dockOnScreen, !probe() { hide(); return }
         guard let tube = dockTubeRect() else { hide(); return }
         guard tube.minY < flip - 20 else { hide(); return }
-        if pid != lastDockPID { lastDockPID = pid; offset = nil }
+        if pid != lastDockPID { lastDockPID = pid; offset = nil; sampledFor = nil }
         sync(tube: tube, flip: flip, dockVisible: true)
     }
 
@@ -599,27 +625,165 @@ final class FinderHider {
         window.alphaValue = 0
     }
 
-    /// AX 左上原点 → NSWindow 左下原点。白板比图标略大一圈，盖掉阴影边。
-    private func coverRect(for cg: CGRect, flip: CGFloat) -> CGRect {
-        // 图标本身约 53pt 宽。左右各外扩 6pt 把 Dock 的内边距吃掉，
-        // 上面加 2pt 盖住图标的投影。
-        let padX: CGFloat = 6
-        let padTop: CGFloat = 2
-        return CGRect(x: cg.minX - padX,
-                      y: flip - cg.maxY,
-                      width: cg.width + padX * 2,
-                      height: cg.height + padTop)
+    /// AX 左上原点 → NSWindow 左下原点。
+    ///
+    /// 遮盖块要正好盖住「底板 + Finder 那一格」：左边界取 Dock 底板左边（那里是圆角，
+    /// 见 FinderHiderView），右边界取 Finder 图标右边，上下各让 1pt
+    /// 让底板自己那圈抗锯齿边保持原样，别让这一格比旁边深一档。
+    private func coverRect(for cg: CGRect, flip: CGFloat, dockLeft: CGFloat) -> CGRect {
+        // 右边界必须正好停在 Finder 图标右边：实测图标间距为 0（Finder 125.6..178.6，
+        // Strata 从 178.6 起），多盖 1pt 就会压到下一个图标的左边缘和它的投影。
+        let top = cg.minY + 1
+        let bottom = cg.maxY - 1
+        return CGRect(x: dockLeft,
+                      y: flip - bottom,
+                      width: cg.maxX - dockLeft,
+                      height: bottom - top)
     }
 }
 
-/// Dock 底色的视觉近似。Dock 是毛玻璃，在彩墨屏上被白板压成接近纯白，
-/// 这里用同色块盖住，看起来就是"那个位置是空的"。
+/// Dock 底板左上/左下圆角半径，实测 r≈23（y=827 处边界在 x≈161，y=845 处到 x≈144）。
+let dockCornerRadius: CGFloat = 23
+
+/// Dock 底板的上下端点色。底板不是纯色，而是一条很轻的竖直渐变
+/// （实测 y=827 是 237,236,235，y=894 是 235,234,232），
+/// 而且这几个数会随 Dock 重绘浮动（同一位置先后量到过 237,236,236 和 236,235,230）。
+/// 所以启动时实测一次，不写死——写死任何一组，遮盖块都会比旁边偏暖或偏冷，一眼能看出来。
+struct DockBaseColors {
+    var top: NSColor
+    var bottom: NSColor
+
+    /// 采样不可用（没有屏幕录制权限）时的退路：取实测中位值。
+    static let fallback = DockBaseColors(
+        top: NSColor(srgbRed: 237.0 / 255, green: 236.0 / 255, blue: 235.0 / 255, alpha: 1),
+        bottom: NSColor(srgbRed: 235.0 / 255, green: 234.0 / 255, blue: 232.0 / 255, alpha: 1))
+}
+
+/// Dock 底色的视觉近似：和底板同色、同渐变的圆角块。
 final class FinderHiderView: NSView {
+    var colors = DockBaseColors.fallback {
+        didSet { needsDisplay = true }
+    }
+
     override var isOpaque: Bool { false }
+
     override func draw(_ dirtyRect: NSRect) {
-        // 不画圆角：Dock 的底板本身就是方角，圆角会在拐角露出底色。
-        NSColor.white.setFill()
-        bounds.fill()
+        // 左边两个角要跟底板一样圆：底板在屏幕左端是圆角，方块盖上去会在那儿多出一块灰。
+        // 右边两角是直角——那条边落在两格图标之间的底色空隙里，同色相接看不出接缝。
+        let r = min(dockCornerRadius, min(bounds.width, bounds.height) / 2)
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: bounds.maxX, y: bounds.maxY))
+        path.addLine(to: CGPoint(x: bounds.minX + r, y: bounds.maxY))
+        path.addArc(tangent1End: CGPoint(x: bounds.minX, y: bounds.maxY),
+                    tangent2End: CGPoint(x: bounds.minX, y: bounds.maxY - r), radius: r)
+        path.addLine(to: CGPoint(x: bounds.minX, y: bounds.minY + r))
+        path.addArc(tangent1End: CGPoint(x: bounds.minX, y: bounds.minY),
+                    tangent2End: CGPoint(x: bounds.minX + r, y: bounds.minY), radius: r)
+        path.addLine(to: CGPoint(x: bounds.maxX, y: bounds.minY))
+        path.closeSubpath()
+
+        let clip = NSBezierPath(cgPath: path)
+        clip.addClip()
+        // NSGradient 的起点是「下」，终点是「上」：截图原点是左上，取色时已经换过来了。
+        NSGradient(starting: colors.bottom, ending: colors.top)?.draw(in: bounds, angle: 90)
+    }
+}
+
+// MARK: - 量 Dock 底板真实底色
+
+/// 截一帧 Dock 条，按行取中性像素的中位数，得到底板上、下两个端点色。
+///
+/// 必须在遮盖块**藏着的时候**采，否则会把自己贴的那块再采一遍（残影）。
+/// 一次 `SCScreenshotManager` 取完即退，不是常驻采集，所以没有漂白那 3% 的代价。
+/// 需要屏幕录制权限（菜单栏漂白已经在用了）；失败就退回 `DockBaseColors.fallback`。
+enum DockBaseSampler {
+    private static var cached: [CGRect: DockBaseColors] = [:]
+
+    /// 在 Dock 底板上量一次上、下端点色。
+    ///
+    /// `band` 是底板实际覆盖的竖直范围（正是遮盖块要盖的那一段），`skip` 是要避开的横向区域
+    /// （Finder 图标自己那几格，图标里的白色会被当成底色）。以 `band` 为准而不是 Dock 条的 AX 矩形：
+    /// 后者顶边比底板高 5pt，那 5pt 是玻璃边和白板，采样会量成接近 255。
+    static func sample(band: CGRect, skip: ClosedRange<CGFloat>, done: @escaping (DockBaseColors) -> Void) {
+        let key = CGRect(x: band.minX.rounded(), y: band.minY.rounded(),
+                         width: band.width.rounded(), height: band.height.rounded())
+        if let c = cached[key] { done(c); return }
+
+        Task {
+            let measured = await capture(band: band, skip: skip)
+            if let m = measured { cached[key] = m }
+            await MainActor.run { done(measured ?? DockBaseColors.fallback) }
+        }
+    }
+
+    private static func capture(band: CGRect, skip: ClosedRange<CGFloat>) async -> DockBaseColors? {
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            let mid = CGPoint(x: band.midX, y: band.midY)
+            guard let d = content.displays.first(where: { $0.frame.contains(mid) }) else { return nil }
+
+            // 上下各让 2pt：底板外侧那一圈抗锯齿边不代表底色。
+            let r = CGRect(x: band.minX, y: band.minY + 2,
+                           width: band.width, height: band.height - 4)
+            guard r.width > 80, r.height > 8 else { return nil }
+
+            let filter = SCContentFilter(display: d, excludingWindows: [])
+            let scale = CGFloat(filter.pointPixelScale)
+            let cfg = SCStreamConfiguration()
+            cfg.sourceRect = CGRect(x: r.minX - d.frame.minX, y: r.minY - d.frame.minY,
+                                    width: r.width, height: r.height)
+            cfg.width = Int(r.width * scale)
+            cfg.height = Int(r.height * scale)
+            cfg.showsCursor = false
+            cfg.pixelFormat = kCVPixelFormatType_32BGRA
+            let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
+
+            let w = img.width, h = img.height
+            guard w > 8, h > 8 else { return nil }
+            var buf = [UInt8](repeating: 0, count: w * h * 4)
+            guard let cs = CGColorSpace(name: CGColorSpace.sRGB),
+                  let ctx = CGContext(data: &buf, width: w, height: h, bitsPerComponent: 8,
+                                      bytesPerRow: w * 4, space: cs,
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+            ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+
+            // 单行取中位数：图标、运行小圆点都只占少数像素，中位数不受影响。
+            func rowColor(_ y: Int) -> (Int, Int, Int)? {
+                var rs: [Int] = [], gs: [Int] = [], bs: [Int] = []
+                for x in 0..<w {
+                    // 跳过被遮的那几格（它们在 band 坐标系里的位置）
+                    let gx = r.minX + CGFloat(x) / scale
+                    if skip.contains(gx) { continue }
+                    let i = (y * w + x) * 4
+                    let red = Int(buf[i]), g = Int(buf[i + 1]), b = Int(buf[i + 2])
+                    let mx = max(red, max(g, b)), mn = min(red, min(g, b))
+                    // 只要中性浅色：底板是灰的；彩色是图标，深色是图标/圆点
+                    guard mx - mn <= 12, (red * 30 + g * 59 + b * 11) / 100 >= 200 else { continue }
+                    rs.append(red); gs.append(g); bs.append(b)
+                }
+                guard rs.count >= 40 else { return nil }
+                func med(_ v: [Int]) -> Int { v.sorted()[v.count / 2] }
+                return (med(rs), med(gs), med(bs))
+            }
+
+            func avg(_ rows: [(Int, Int, Int)]) -> NSColor? {
+                guard !rows.isEmpty else { return nil }
+                let n = Double(rows.count)
+                let red = rows.reduce(0) { $0 + Double($1.0) } / n
+                let g = rows.reduce(0) { $0 + Double($1.1) } / n
+                let b = rows.reduce(0) { $0 + Double($1.2) } / n
+                return NSColor(srgbRed: red / 255, green: g / 255, blue: b / 255, alpha: 1)
+            }
+
+            // 上端取最上面 2 行、下端取最下面 2 行，各自平均，滤掉单行噪声。
+            let topRows = [1, 2].compactMap { rowColor($0) }
+            let bottomRows = [h - 2, h - 3].compactMap { rowColor($0) }
+            guard let top = avg(topRows), let bottom = avg(bottomRows) else { return nil }
+            return DockBaseColors(top: top, bottom: bottom)
+        } catch {
+            FileHandle.standardError.write("\(Date()) dock-base 采样失败：\(error.localizedDescription)\n".data(using: .utf8)!)
+            return nil
+        }
     }
 }
 /// 找到 Dock 里 Finder 那一格的矩形（CG 全局坐标，左上原点）。
