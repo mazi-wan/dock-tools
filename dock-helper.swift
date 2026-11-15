@@ -544,7 +544,7 @@ final class FinderHider {
                           y: tube.minY + off.dy,
                           width: off.w,
                           height: off.h)
-        let target = coverRect(for: item, flip: flip)
+        let target = coverRect(for: item, tube: tube, flip: flip)
         if applied != target {
             applied = target
             window.setFrame(target, display: true)
@@ -599,16 +599,20 @@ final class FinderHider {
         window.alphaValue = 0
     }
 
-    /// AX 左上原点 → NSWindow 左下原点。白板比图标略大一圈，盖掉阴影边。
-    private func coverRect(for cg: CGRect, flip: CGFloat) -> CGRect {
-        // 图标本身约 53pt 宽。左右各外扩 6pt 把 Dock 的内边距吃掉，
-        // 上面加 2pt 盖住图标的投影。
+    /// AX 左上原点 → NSWindow 左下原点。
+    ///
+    /// 竖直方向**必须对齐 Dock 白板**（tube 上下各 2pt），不能用图标自己的矩形：
+    /// AX 给的图标是 `(152,826,53,69)`，而 Dock 条是 `(144,821,1312,69)`——
+    /// 高度一样但整体低了 5pt，直接拿来铺会一直铺到 895，
+    /// 比 Dock 底板的下沿还多出一截（左右两边看着一高一低）。
+    private func coverRect(for cg: CGRect, tube: CGRect, flip: CGFloat) -> CGRect {
+        // 图标本身约 53pt 宽。左右各外扩 6pt 把 Dock 的内边距吃掉。
         let padX: CGFloat = 6
-        let padTop: CGFloat = 2
+        let pad: CGFloat = 2
         return CGRect(x: cg.minX - padX,
-                      y: flip - cg.maxY,
+                      y: flip - tube.maxY - pad,
                       width: cg.width + padX * 2,
-                      height: cg.height + padTop)
+                      height: tube.height + pad * 2)
     }
 }
 
@@ -617,18 +621,32 @@ final class FinderHider {
 final class FinderHiderView: NSView {
     override var isOpaque: Bool { false }
 
-    /// 遮盖块的颜色。必须和 Dock 底板一致，不能用纯白。
+    /// 遮盖块的底色。必须和 Dock 底板一致，不能用纯白。
     ///
     /// 实测：Dock 中间那层不是透明的——它自己画了一层不透明底板，
-    /// 稳定在 (236,236,236)。面板白板（level 3）只影响 Dock 最上面 3pt
+    /// 稳定在 (236,236,236)。面板白板（level 3）只影响 Dock 最上面 6pt
     /// 的毛玻璃边缘（253→255）和中段那点浮层，中间主体仍是 236。
     /// 所以填 255 会比周围亮 19 级，看起来像贴了块白纸。
-    static let fillColor = NSColor(srgbRed: 236/255, green: 236/255, blue: 236/255, alpha: 1)
+    ///
+    /// 想试别的值：`FINDER_SHADE=255 ./dock-helper ...`
+    static let fillColor: NSColor = {
+        let v = Int(ProcessInfo.processInfo.environment["FINDER_SHADE"] ?? "") ?? 236
+        let c = CGFloat(max(0, min(255, v))) / 255
+        return NSColor(srgbRed: c, green: c, blue: c, alpha: 1)
+    }()
+
+    /// Dock 顶边那圈玻璃在面板白板下是纯白，约 6pt。
+    /// 不照抄这段的话，遮盖块的上边缘会比 Dock 其它位置更早变灰，
+    /// 看上去就是「左边这一块比右边高了一点」。
+    private static let rimHeight: CGFloat = 6
 
     override func draw(_ dirtyRect: NSRect) {
         // 不画圆角：Dock 的底板本身就是方角，圆角会在拐角露出底色。
         FinderHiderView.fillColor.setFill()
         bounds.fill()
+        NSColor.white.setFill()
+        NSRect(x: 0, y: bounds.maxY - FinderHiderView.rimHeight,
+               width: bounds.width, height: FinderHiderView.rimHeight).fill()
     }
 }
 /// 找到 Dock 里 Finder 那一格的矩形（CG 全局坐标，左上原点）。
