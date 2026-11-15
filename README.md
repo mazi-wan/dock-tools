@@ -11,6 +11,7 @@
 | `apps_toggle`          | 启动器打开时再点 Dock 图标能正常关闭（macOS 26 的 bug） |
 | `menu_bar_line`        | 菜单栏漂成纯白，并压掉底边那条 1pt 深灰线               |
 | `hide_finder`          | 用白板盖住 Dock 最左边的 Finder 图标                    |
+| `dock_white`           | 整条 Dock 漂成纯白（实验，默认关，约 3% CPU）            |
 
 配置文件 `~/.config/dock-tools/config.conf`，保存后约 2 秒生效。  
 程序本体从 `~/Library/Application Support/dock-tools/` 启动（launchd 读不了 NFS）；  
@@ -71,22 +72,35 @@ Finder 本身没被禁用，⌘N、点桌面都照旧。
 
 Dock 收起时两者一起隐藏；面板没开时退回 0.1 秒自查（精度差些，但至少能盖住）。
 
-### 3. Chrome 菜单白底（`menu_white`）
+### 3. Dock 漂白（`dock_white`，实验，默认关）
+
+想把**整条 Dock** 变成纯白只有一条路：截屏 → 把背景推成纯白 → 以 level 24 贴回去
+（和菜单栏同一套。垫白板不行：底板是「壁纸 × 0.93」，255 × 0.93 ≈ 237）。
+
+实现上踩过两处：采集必须用「显示器 + `sourceRect` 只裁 Dock 那一条」
+（Dock 的窗口是整个屏幕，单窗口采要 3200×1800）；漂白判据必须是
+「接近中性灰且够亮」，只按亮度（阈值 200）会把日历、备忘、设置洗成白块。
+
+**实测常驻约 3% CPU，且和帧率无关**（1fps 也是 2.9%，是采集会话本身的开销），
+所以默认关闭。打开后 Finder 遮盖块会自动改成纯白（`FinderHiderView.fillColor`）。
+代价对比：关着 0.5%，开着 3%。
+
+### 4. Chrome 菜单白底（`menu_white`）
 
 Chrome 右键菜单（layer 101）也是毛玻璃。同样在它后面垫白色圆角板（level 3）。  
 菜单一关闭窗口就从 `CGWindowList` 里消失，据此收掉白板——**空闲时不跑定时器**。
 
-### 4. 去窗口阴影（`remove_window_shadow`）
+### 5. 去窗口阴影（`remove_window_shadow`）
 
 交给 yabai：`yabai -m config window_shadow off`。  
 守护循环只在 yabai 换 pid / 开关切换 / 60 秒时重发。
 
-### 5. 启动器点击修正（`apps_toggle`）
+### 6. 启动器点击修正（`apps_toggle`）
 
 macOS 26 里启动器（`com.apple.campo`）打开时，点 Dock 图标不会关闭它。  
 用 CGEvent tap 监听点击，命中 Dock 的「启动器」格子且启动器正开着时，补发一次 AX press。
 
-### 6. 菜单栏漂白（`menu_bar_line`）
+### 7. 菜单栏漂白（`menu_bar_line`）
 
 「降低透明度」开着时系统把菜单栏画成不透明灰（实测 sRGB 218），  
 并在底边压一条 1pt 深灰线（约 120）。彩墨屏上菜单栏和背景窗几乎同色。
@@ -116,6 +130,7 @@ AX 读不到里面的元素，所以没法「只重绘背景、保留图标」�
 | Dock 白板（2Hz 轮询，指针远离 Dock）  | 约 0.05%          | 约 10 MB       |
 | 启动器点击修正                     | 约 0.01%          | 约 7 MB        |
 | 隐藏 Finder（跟白板同帧，收起不耗）  | 约 0.03%          | 约 1 MB        |
+| Dock 漂白（`dock_white`，默认关）    | 约 +2.5%（常驻，与帧率无关） | 约 6 MB |
 | `dock-helper` 合计             | **约 0.2~0.45%** | 17~67 MB（见下） |
 | `menu-shade`                | 0%（无定时器）         | 约 60 MB       |
 | 守护脚本                        | **约 0.05%**      | 约 3 MB        |

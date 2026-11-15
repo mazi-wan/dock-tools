@@ -7,6 +7,7 @@
 #   apps_toggle=1            App 启动器打开时，再点 Dock 图标能正常关闭（macOS 26 的 bug 修正）。
 #   menu_bar_line=1          盖掉菜单栏底边那条 1pt 深灰线（「降低透明度」开着时系统会画）。
 #   hide_finder=1            用白板盖住 Dock 最左边的 Finder 图标（Finder 本身仍在，⌘N 照旧）。
+#   dock_white=1             把整条 Dock 漂成纯白（截屏漂白再贴回，底板材质到不了 255）。
 #   改 ~/.config/dock-tools/config.conf 保存后约 2 秒生效，不用重装。
 # 用法: dock-tools.sh [on|off|apply|revert|status|build|install|daemon]
 #   on      一键全开：把五项开关写成 1，安装并启动 LaunchAgent。
@@ -39,6 +40,8 @@ HELPER_BIN="$HERE/dock-helper"
 HELPER_SRC="$HERE/dock-helper.swift"
 MENU_BIN="$HERE/menu-shade"
 MENU_SRC="$HERE/menu-shade.swift"
+MAIN_SRC="$HERE/main.swift"
+HELPER_WHITE_SRC="$HERE/dock-white.swift"
 CONF="${DOCK_TOOLS_CONF:-$HOME/.config/dock-tools/config.conf}"
 LOG="$HOME/Library/Logs/dock-tools.log"
 # 运行位置。源码在 NFS 上，但 launchd 进程读不了网络卷（TCC 挡的，
@@ -51,8 +54,9 @@ for p in /opt/homebrew/bin/yabai /usr/local/bin/yabai; do
 done
 
 build() {
-    build_one "$HELPER_SRC" "$HELPER_BIN" dock-helper
-    build_one "$MENU_SRC" "$MENU_BIN" menu-shade
+    # dock-helper 现在分三个文件：入口(main.swift)、主体、Dock 漂白
+    build_one "$HELPER_BIN" dock-helper "$MAIN_SRC" "$HELPER_SRC" "$HELPER_WHITE_SRC"
+    build_one "$MENU_BIN" menu-shade "$MENU_SRC"
 }
 
 # 自签证书: 用固定的证书签名后，辅助功能/屏幕录制的授权绑定到证书(certificate leaf)，
@@ -73,9 +77,9 @@ sign_one() {
 build_one() {
     # 先编到临时目录再换上去: 直接覆盖正在运行的二进制会让签名在写入中途失效。
     # 输出文件名保持原名, 二进制的 Identifier 就是它。
-    local src="$1" out="$2" name="$3"
+    local out="$1" name="$2"; shift 2
     local tmpdir; tmpdir=$(mktemp -d)
-    swiftc -O -o "$tmpdir/$name" "$src"
+    swiftc -O -o "$tmpdir/$name" "$@"
     chmod +x "$tmpdir/$name"
     sign_one "$tmpdir/$name" "$name"
     mv -f "$tmpdir/$name" "$out"
@@ -128,6 +132,11 @@ poll=2
 
 # 菜单栏底边: 盖掉「降低透明度」在菜单栏下面画的那条 1pt 深灰线。
 menu_bar_line=0
+
+# Dock 漂白: 把整条 Dock 底板推成纯白(截屏漂白再贴回)。
+# 实测常驻约 3% CPU(采集会话本身的开销,和帧率无关),默认关闭。
+# 打开后 Finder 遮盖块也会自动变成纯白。
+dock_white=0
 EOF
 }
 
@@ -199,7 +208,7 @@ load_conf() {
     [ "$key_digest" = "${_conf_digest:-}" ] && return 0
     _conf_digest="$key_digest"
 
-    local dock_opaque=1 menu_white=1 remove_window_shadow=1 apps_toggle=1 menu_bar_line=0 hide_finder=0 poll=2
+    local dock_opaque=1 menu_white=1 remove_window_shadow=1 apps_toggle=1 menu_bar_line=0 hide_finder=0 dock_white=0 poll=2
     local -a lines
     lines=("${(@f)content}")
     for line in "${lines[@]}"; do
@@ -218,6 +227,7 @@ load_conf() {
             apps_toggle)            [ -n "$val" ] && apps_toggle="$val" ;;
             menu_bar_line)          [ -n "$val" ] && menu_bar_line="$val" ;;
             hide_finder)            [ -n "$val" ] && hide_finder="$val" ;;
+            dock_white)             [ -n "$val" ] && dock_white="$val" ;;
             poll)                   [ -n "$val" ] && poll="$val" ;;
         esac
     done
@@ -230,6 +240,7 @@ load_conf() {
     APPS_TOGGLE=$apps_toggle;            [ "$APPS_TOGGLE" = "0" ] || APPS_TOGGLE=1
     MENU_BAR_LINE=$menu_bar_line;        [ "$MENU_BAR_LINE" = "0" ] || MENU_BAR_LINE=1
     HIDE_FINDER=$hide_finder;            [ "$HIDE_FINDER" = "0" ] || HIDE_FINDER=1
+    DOCK_WHITE=$dock_white;              [ "$DOCK_WHITE" = "1" ] || DOCK_WHITE=0
     POLL=$poll
     # poll=0 会让守护循环变成死循环空转
     [ "$POLL" -ge 1 ] 2>/dev/null || POLL=1
@@ -306,6 +317,7 @@ panel_running() { [[ "$(helper_args)" == *"--panel=1"* ]] }
 tap_running()   { [[ "$(helper_args)" == *"--tap=1"* ]] }
 menubar_running() { [[ "$(helper_args)" == *"--menubar=1"* ]] }
 nofinder_running() { [[ "$(helper_args)" == *"--nofinder=1"* ]] }
+dockwhite_running() { [[ "$(helper_args)" == *"--dockwhite=1"* ]] }
 
 kill_by_name() {
     # 不判断返回值：pgrep/pkill 在某些状态下会返回非零，配合 set -e 会直接中断脚本
@@ -360,17 +372,18 @@ daemon() {
 
         # 一个进程同时承担面板和点击修正，用参数说明开哪几项
         if [ "$DOCK_OPAQUE" = "0" ] && [ "$APPS_TOGGLE" = "0" ] && [ "$MENU_BAR_LINE" = "0" ] \
-           && [ "$HIDE_FINDER" = "0" ]; then
+           && [ "$HIDE_FINDER" = "0" ] && [ "$DOCK_WHITE" = "0" ]; then
             [ -n "$helper_pid" ] && { stop_helper; helper_pid=""; }
             started_flags=""
         else
-            local want_flags="panel=$DOCK_OPAQUE tap=$APPS_TOGGLE menubar=$MENU_BAR_LINE nofinder=$HIDE_FINDER"
+            local want_flags="panel=$DOCK_OPAQUE tap=$APPS_TOGGLE menubar=$MENU_BAR_LINE nofinder=$HIDE_FINDER dockwhite=$DOCK_WHITE"
             if [ "$want_flags" != "$started_flags" ] || [ -z "$helper_pid" ]; then
                 [ -n "$helper_pid" ] && stop_helper
                 "$HELPER_EXE" --panel="$DOCK_OPAQUE" --tap="$APPS_TOGGLE" \
-                    --menubar="$MENU_BAR_LINE" --nofinder="$HIDE_FINDER" >>"$LOG" 2>&1 &
+                    --menubar="$MENU_BAR_LINE" --nofinder="$HIDE_FINDER" \
+                    --dockwhite="$DOCK_WHITE" >>"$LOG" 2>&1 &
                 helper_pid=$!
-                echo "$(date '+%F %T') 启动 dock-helper pid=$helper_pid (panel=$DOCK_OPAQUE tap=$APPS_TOGGLE menubar=$MENU_BAR_LINE nofinder=$HIDE_FINDER)"
+                echo "$(date '+%F %T') 启动 dock-helper pid=$helper_pid (panel=$DOCK_OPAQUE tap=$APPS_TOGGLE menubar=$MENU_BAR_LINE nofinder=$HIDE_FINDER dockwhite=$DOCK_WHITE)"
                 started_flags="$want_flags"
             fi
         fi
@@ -435,6 +448,8 @@ apply() {
     ensure_conf_key menu_white 1 "Chrome 右键菜单白底: 在菜单后面垫白板, 菜单不再透出网页内容。"
     ensure_conf_key apps_toggle 1 "App 启动器打开时再点 Dock 图标能正常关闭。"
     ensure_conf_key menu_bar_line 0 "菜单栏底边: 盖掉\"降低透明度\"在菜单栏下面画的那条 1pt 深灰线。"
+    ensure_conf_key hide_finder 1 "用白板盖住 Dock 最左边的 Finder 图标(Finder 本身仍在)。"
+    ensure_conf_key dock_white 0 "把整条 Dock 漂成纯白(截屏漂白, 约 3% CPU, 默认关闭)。"
     mkdir -p "$HOME/Library/LaunchAgents" "$(dirname "$LOG")"
     make_plist > "$HOME/Library/LaunchAgents/${LABEL}.plist"
     local uid; uid=$(id -u)
@@ -464,7 +479,7 @@ apply() {
     load_conf
     if launchctl print "gui/${uid}/${LABEL}" >/dev/null 2>&1; then
         echo "已应用: ${LABEL}"
-        echo "配置: $CONF (dock_opaque=$DOCK_OPAQUE menu_white=$MENU_WHITE remove_window_shadow=$REMOVE_WINDOW_SHADOW apps_toggle=$APPS_TOGGLE menu_bar_line=$MENU_BAR_LINE hide_finder=$HIDE_FINDER)"
+        echo "配置: $CONF (dock_opaque=$DOCK_OPAQUE menu_white=$MENU_WHITE remove_window_shadow=$REMOVE_WINDOW_SHADOW apps_toggle=$APPS_TOGGLE menu_bar_line=$MENU_BAR_LINE hide_finder=$HIDE_FINDER dock_white=$DOCK_WHITE)"
         echo "日志: $LOG"
     else
         echo "启动失败，看 $LOG" >&2
@@ -480,6 +495,8 @@ on() {
     conf_set apps_toggle 1
     conf_set menu_bar_line 1
     conf_set hide_finder 1
+    # Dock 漂白是实验特性(约 3% CPU),一键全开不带它
+    conf_set dock_white 0
     apply
 }
 
@@ -491,6 +508,7 @@ off() {
     conf_set apps_toggle 0
     conf_set menu_bar_line 0
     conf_set hide_finder 0
+    conf_set dock_white 0
     revert
 }
 
@@ -508,7 +526,7 @@ revert() {
 status() {
     load_conf
     echo "配置: $CONF"
-    echo "  dock_opaque=$DOCK_OPAQUE  menu_white=$MENU_WHITE  remove_window_shadow=$REMOVE_WINDOW_SHADOW  apps_toggle=$APPS_TOGGLE  menu_bar_line=$MENU_BAR_LINE  hide_finder=$HIDE_FINDER  poll=$POLL"
+    echo "  dock_opaque=$DOCK_OPAQUE  menu_white=$MENU_WHITE  remove_window_shadow=$REMOVE_WINDOW_SHADOW  apps_toggle=$APPS_TOGGLE  menu_bar_line=$MENU_BAR_LINE  hide_finder=$HIDE_FINDER  dock_white=$DOCK_WHITE  poll=$POLL"
     echo "运行位置: $LOCAL_DIR"
     echo "服务: $(launchctl print gui/$(id -u)/${LABEL} >/dev/null 2>&1 && echo 运行中 || echo 未运行)"
     echo "面板: $(panel_running && echo 在跑 || echo 未运行)"
@@ -516,6 +534,7 @@ status() {
     echo "启动器修正: $(tap_running && echo 在跑 || echo 未运行)"
     echo "菜单栏底边: $(menubar_running && echo 在跑 || echo 未运行)"
     echo "隐藏 Finder: $(nofinder_running && echo 在跑 || echo 未运行)"
+    echo "Dock 漂白: $(dockwhite_running && echo 在跑 || echo 未运行)"
     echo "yabai: $(yabai_running && echo 运行中 || echo 未运行)"
     if yabai_running; then
         echo "有阴影的窗口: $(shadow_count)"
