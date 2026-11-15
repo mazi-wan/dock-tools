@@ -144,6 +144,9 @@ final class DockShade {
     /// 遮住 Dock 上的 Finder。挂在这里是为了和白板共用同一帧几何，完全同步。
     var finderHider: FinderHider?
 
+    /// 压平 Dock 顶部那条内阴影。同样挂在这里，和白板共用几何。
+    var topFlattener: DockTopFlattener?
+
     init() {
         window = NSWindow(contentRect: .zero, styleMask: .borderless,
                           backing: .buffered, defer: false)
@@ -253,6 +256,7 @@ final class DockShade {
             setAlpha(false)
             rising = false
             finderHider?.sync(tube: .zero, flip: flip, dockVisible: false, settled: false)
+            topFlattener?.sync(tube: .zero, innerTop: 0, flip: flip, dockVisible: false)
             return
         }
         let settledTop = flip - cg.height - gap
@@ -305,6 +309,13 @@ final class DockShade {
         lastCgMinY = cg.minY
         finderHider?.sync(tube: settledTube, flip: flip,
                           dockVisible: alphaOn || rising, settled: !rising)
+        // 内阴影带的下沿：图标真正开始绘制的那一行（AX 图标矩形从 826 起，
+        // 但那是命中区，实测第一行彩色像素在 841）。
+        // 下沿停在 838（settledTop 821 + 17）。各列实测：图标主体从 841/842 起，
+        // 但抗锯齿从 839 就有了（839 已经是 232/233，840 是 224）。
+        // 压到 839 会把那一行一起盖平，图标顶部看起来被削掉一条。
+        topFlattener?.sync(tube: settledTube, innerTop: settledTop + 17, flip: flip,
+                           dockVisible: alphaOn || rising)
     }
 }
 
@@ -430,6 +441,9 @@ var panelShade: DockShade?
 /// 遮住 Dock 上的 Finder。Timer 用 weak self，必须强引用。
 var finderHider: FinderHider?
 
+/// 压平 Dock 顶部内阴影的那条窄带。同样要强引用。
+var topFlattener: DockTopFlattener?
+
 
 func runHelper() {
     let app = NSApplication.shared
@@ -496,6 +510,15 @@ func runHelper() {
         fflush(stdout)
     }
 
+    // 顶部内阴影压平：和 Finder 遮盖同一套依赖（都要面板在跑才知道 Dock 在哪）。
+    if wantsPanel && wantsNoFinder {
+        let flattener = DockTopFlattener()
+        if let shade = panelShade {
+            shade.topFlattener = flattener
+        }
+        topFlattener = flattener      // 强引用
+    }
+
     if wantsNoFinder {
         let hider = FinderHider()
         if let shade = panelShade {
@@ -559,6 +582,101 @@ func axFrame(_ el: AXUIElement) -> CGRect? {
     AXValueGetValue(sv as! AXValue, .cgSize, &s)
     guard s.width > 0, s.height > 0 else { return nil }
     return CGRect(origin: p, size: s)
+}
+
+// MARK: - 压平 Dock 顶部那条内阴影
+
+// Dock 底板顶部有一条约 15pt 的内阴影带：从 y=826 的 239 一路降到 y=840 的 224，
+// 而图标区下方的平坦值是 237。视觉上就是"上半截发灰、不是纯白"。
+//
+// 这条渐变是 Dock 自己画的，垫白板改不了（白板只能把整体抬到 234 上下）。
+// 唯一能做的是**在 Dock 之上**（层级 24）盖一条同样颜色的窄带，把它抹平成 237。
+//
+// 为什么碰不到图标：AX 报的图标矩形从 y=826 起，但那是**命中区**；
+// 图标真正开始绘制是 y=841（实测第一行彩色像素）。所以 826..840 这段是纯底色，
+// 盖住它不会切到任何图标。
+//
+// 只在 Dock 展开时显示，和白板/遮盖块共用同一帧几何。
+
+final class DockTopFlattener {
+    private let window: NSWindow
+    private var applied: CGRect?
+
+    init() {
+        window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 4, height: 4),
+                          styleMask: .borderless, backing: .buffered, defer: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.isMovable = false
+        window.isReleasedWhenClosed = false
+        window.level = NSWindow.Level(rawValue: 24)
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.contentView = DockTopFlatView(frame: CGRect(x: 0, y: 0, width: 4, height: 4))
+        window.alphaValue = 0
+        window.orderFrontRegardless()
+    }
+
+    /// tube 是落定的 Dock 命中区矩形；`innerTop` 是内阴影带的底边（屏幕坐标）。
+    func sync(tube: CGRect, innerTop: CGFloat, flip: CGFloat, dockVisible: Bool) {
+        guard dockVisible else { hide(); return }
+        // 带子从底板顶边（命中区顶 + 5）到最后一行非图标像素。
+        let screenTop = tube.minY + 5
+        let screenBottom = innerTop
+        guard screenBottom > screenTop else { hide(); return }
+        // 铺满整条，两端的圆角交给视图自己裁（见 DockTopFlatView）。
+        // 缩进的做法会在圆角区留下一块没压平的暗区，交界处出现一条竖直硬边。
+        let target = CGRect(x: tube.minX,
+                            y: flip - screenBottom,
+                            width: tube.width,
+                            height: screenBottom - screenTop)
+        if applied != target {
+            applied = target
+            window.setFrame(target, display: true)
+            window.orderFrontRegardless()
+            if window.alphaValue < 1 { window.alphaValue = 1 }
+        } else if window.alphaValue < 1 {
+            window.alphaValue = 1
+        }
+    }
+
+    private func hide() {
+        guard applied != nil || window.alphaValue > 0 else { return }
+        applied = nil
+        window.alphaValue = 0
+    }
+}
+
+/// 顶部压平层：图标区下方的平坦底板色，两端按底板圆角裁剪。
+final class DockTopFlatView: NSView {
+    override var isOpaque: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        // 圆角只作用在**上边**两个角：这一条的下半截接着图标区，那里必须是直角
+        // （图标区两侧是直的），下边画圆角会在中间凭空切出两个缺口。
+        //
+        // 用一个上圆下直的路径：左上/右上走圆角，左下/右下直接落到底。
+        let r = dockPanelCornerRadius
+        let p = CGMutablePath()
+        p.move(to: CGPoint(x: bounds.minX, y: bounds.minY))
+        p.addLine(to: CGPoint(x: bounds.minX, y: bounds.maxY - r))
+        p.addArc(tangent1End: CGPoint(x: bounds.minX, y: bounds.maxY),
+                 tangent2End: CGPoint(x: bounds.minX + r, y: bounds.maxY), radius: r)
+        p.addLine(to: CGPoint(x: bounds.maxX - r, y: bounds.maxY))
+        p.addArc(tangent1End: CGPoint(x: bounds.maxX, y: bounds.maxY),
+                 tangent2End: CGPoint(x: bounds.maxX, y: bounds.maxY - r), radius: r)
+        p.addLine(to: CGPoint(x: bounds.maxX, y: bounds.minY))
+        p.closeSubpath()
+
+        NSGraphicsContext.current?.cgContext.saveGState()
+        NSBezierPath(cgPath: p).addClip()
+        // 顶端到底端有极轻的余留渐变（237 → 236），保证和下方图标区接得上。
+        let top = NSColor(srgbRed: 237.0 / 255, green: 237.0 / 255, blue: 236.0 / 255, alpha: 1)
+        let bottom = NSColor(srgbRed: 237.0 / 255, green: 236.0 / 255, blue: 234.0 / 255, alpha: 1)
+        NSGradient(starting: bottom, ending: top)?.draw(in: bounds, angle: 90)
+        NSGraphicsContext.current?.cgContext.restoreGState()
+    }
 }
 
 // MARK: - 隐藏 Dock 最左边的 Finder
