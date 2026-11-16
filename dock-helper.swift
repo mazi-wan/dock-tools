@@ -54,54 +54,33 @@ func requestAccessibility() {
 // MARK: - 面板模式
 
 final class PanelView: NSView {
-    /// 白板底部露出的那条补齐带的高度（屏幕最底这几 pt）。
-    ///
-    /// Dock 底板实际画到「屏幕底 - 6」（实测 894），再往下就是壁纸了。
-    /// 平时那 5~6pt 是 macOS 自己留的缝（底板上方采样灰 236，下面直接是壁纸 249），
-    /// 垫了白板之后这条缝尤其显眼——上面一片均匀的灰、最底突然亮一档，
-    /// 看着就像"底座底部透出了后面的颜色"。
-    ///
-    /// 所以白板往下多铺这一段，并且不画白色、直接画底板的颜色：
-    /// 底板在那一段不再采样，露出来的就是这里画的色块，视觉上和底板连成一片。
-    /// 实测取向：底板画到 894 结束、894.5 还留着它自己的一行渐隐边（241，
-    /// 比底板亮 8 级），895 起才是壁纸。所以补 7pt，把那行渐隐边一起盖掉。
-    static let bottomFillHeight: CGFloat = 7
-
     override func draw(_ dirtyRect: NSRect) {
         // 白板只是"垫在 Dock 后面的白纸"，不需要自己描出 Dock 的轮廓：
         // Dock 底板会把整块采样掉，白板自己的边缘只在超出底板时才会露出来。
         //
-        // 上、左、右内缩 1pt：让白板自己的抗锯齿边落在底板之内，
-        // 否则两圈抗锯齿边互相咬合会在四角留下细碎灰点。
-        // 下边不内缩——最底那 6pt 要用来补缝（见下）。
-        let pad: CGFloat = 1
-        let fillH = Self.bottomFillHeight
-        let body = CGRect(x: bounds.minX + pad, y: bounds.minY + fillH,
-                          width: bounds.width - pad * 2, height: bounds.height - pad - fillH)
-        NSColor.white.setFill()
-        NSBezierPath(roundedRect: body, xRadius: dockPanelCornerRadius,
-                     yRadius: dockPanelCornerRadius).fill()
-
-        // 底部补齐带：用底板的底色，和上方连成一片。
-        // 只盖住底板不再绘制的那一段，不侵入底板本身。
+        // **整块只填一种颜色，不分上下段。**
         //
-        // 左右轮廓必须**和上面那块圆角矩形共用同一段圆弧**：
-        // 底板左下/右下是圆的，单独铺一个矮矩形会在圆角已经收窄的那几行
-        // 超出轮廓，屏幕左下/右下多出两个直角方块。
-        // 做法是拿整块圆的矩形裁一次、只填最底那条：
-        let strip = CGRect(x: bounds.minX + pad, y: bounds.minY,
-                           width: bounds.width - pad * 2, height: fillH)
-        let fullRound = NSBezierPath(roundedRect: CGRect(x: bounds.minX + pad, y: bounds.minY,
-                                                        width: bounds.width - pad * 2,
-                                                        height: bounds.height - pad),
-                                     xRadius: dockPanelCornerRadius,
-                                     yRadius: dockPanelCornerRadius)
-        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        ctx.saveGState()
-        defer { ctx.restoreGState() }
-        NSBezierPath(rect: strip).addClip()
-        fullRound.addClip()
-        dockBaseBottom.setFill()
+        // 早先为了让 Dock 最底那几 pt（底板到「屏幕底 - 6」就不再画了，下面是壁纸）
+        // 不发亮，把白板拆成"上半白色 + 底部一条底板色"。结果两段之间多了一条
+        // 明显更亮的横带：Dock 对上半段的白色采样得到 236，对下半段的底色几乎
+        // 原样透出，交界处就像一盏投光灯打过去。上下必须是一整块。
+        //
+        // 上、左、右内缩 1pt：让白板自己的抗锯齿边落在底板之内，否则两圈
+        // 抗锯齿边互相咬合会在四角留下细碎灰点。
+        // **下边不内缩**：Dock 底板只画到「屏幕底 - 6」，再往下是壁纸；
+        // 白板要是也缩 1pt，最底就会漏出一条纯白。铺到屏幕最底才对。
+        let body = CGRect(x: bounds.minX + 1, y: bounds.minY,
+                          width: bounds.width - 2, height: bounds.height - 1)
+        let path = CGPath(roundedRect: body, cornerWidth: dockPanelCornerRadius,
+                          cornerHeight: dockPanelCornerRadius, transform: nil)
+        NSColor.white.setFill()
+        NSBezierPath(cgPath: path).fill()
+
+        // 最底那几 pt（Dock 底板不再绘制的地方）用 Dock 渐变末端的颜色，
+        // 和上面接上。见 dockBaseVeryBottom 的注释。
+        let strip = CGRect(x: bounds.minX + 1, y: bounds.minY,
+                           width: bounds.width - 2, height: 7)
+        dockBaseVeryBottom.setFill()
         strip.fill()
     }
 }
@@ -1187,6 +1166,14 @@ let dockCornerRadius: CGFloat = 16
 /// （实测遮盖块顶端用 234 时，交界比压平层暗 3 级，形成阶梯状接缝）。
 let dockBaseTop = NSColor(srgbRed: 237.0 / 255, green: 236.0 / 255, blue: 234.0 / 255, alpha: 1)
 let dockBaseBottom = NSColor(srgbRed: 236.0 / 255, green: 235.0 / 255, blue: 233.0 / 255, alpha: 1)
+
+/// Dock 底板**最下沿**实际渲染出来的颜色（在面板上垫着白板时的实测值）。
+///
+/// Dock 自己会在这块区域叠一层竖直渐变：顶端 237、底端 227（实测 x=400 那一列，
+/// 826 → 894）。而底板只画到「屏幕底 - 6」，再往下就轮到我们垫的白板露出来了。
+/// 那段必须用 227 而不是 236，否则 Dock 的渐变走到 227 之后突然跳回 236，
+/// 屏幕最底下多一条亮带——就是看起来"上下没连成一个整体"的那条缝。
+let dockBaseVeryBottom = NSColor(srgbRed: 227.0 / 255, green: 227.0 / 255, blue: 225.0 / 255, alpha: 1)
 
 /// Dock 底色的视觉近似：和底板同色的圆角块。
 final class FinderHiderView: NSView {
