@@ -135,6 +135,30 @@ final class DockShade {
     /// 初值是 nil 而不是 ±infinity：第一帧还不知道方向，不该猜成"升起"。
     private var lastCgMinY: CGFloat?
 
+    /// 当前这段动画的方向。AX 在动画里会小抖（回退 1~2pt），
+    /// 早先每帧拿相邻两帧直接比大小，方向会来回翻——表现为收起途中
+    /// 白板/压平层闪回一下（实测 pan/flat 的 alpha 是 0→1→0）。
+    /// 所以方向做成"粘性"状态：同向连续 3 帧才改。
+    private enum Motion { case unknown, rising, falling }
+    private var motion: Motion = .unknown
+    private var motionVotes = 0
+
+    /// 用相邻两帧的位移更新方向，粘性见上。
+    private func updateMotion(_ y: CGFloat) {
+        guard let last = lastCgMinY else { return }
+        let delta = y - last
+        guard abs(delta) >= 0.5 else { return }
+        let dir: Motion = delta > 0 ? .falling : .rising
+        if motion == dir { motionVotes = 0; return }
+        motionVotes += 1
+        if motion == .unknown || motionVotes >= 3 {
+            motion = dir
+            motionVotes = 0
+        }
+    }
+
+    private func resetMotion() { motion = .unknown; motionVotes = 0 }
+
     /// 遮住 Dock 上的 Finder。挂在这里是为了和白板共用同一帧几何，完全同步。
     var finderHider: FinderHider?
 
@@ -179,7 +203,9 @@ final class DockShade {
     /// Dock 完全收起、白板也隐藏时，指针在热区里随便移动都不需要查 AX——
     /// 实测这种空转占掉了 helper 常驻开销的一半以上。
     var engaged: Bool {
-        alphaOn || rising
+        // 遮盖块也算：收起动画里白板先灭、遮盖块要一直跟着图标滑到屏外，
+        // 这段时间必须继续跟踪（否则最后一次 update 停在 alpha=1 就再没人改它）。
+        alphaOn || rising || (finderHider?.isVisible ?? false)
     }
 
     // 白板矩形 = Dock 的 x/宽/高 + 上下留 pad，顶边跟随落定后的 Dock 顶
@@ -263,7 +289,8 @@ final class DockShade {
         }
         let settledTop = flip - cg.height - gap
         // Dock 自动隐藏时矩形落在屏外
-        if cg.minY >= flip - 1 {
+        let onScreen = cg.minY < flip - 1
+        if !onScreen {
             // 收起：白板留在落定位置（下次召唤直接点亮，不用再搬窗口），并灭掉。
             // 不灭的话底板已经滑走、白板还亮着，看着就是"白板消失有延迟"。
             //
@@ -276,6 +303,7 @@ final class DockShade {
             // 不参与这里的判断。
             place(panelRect(cg, top: settledTop, flip: flip))
             rising = false
+            resetMotion()
             setAlpha(false)
         } else if cg.minY > settledTop + 1 {
             // 升/收动画中：白板停在最终位置。跟着动画走必然慢半拍，
@@ -284,36 +312,49 @@ final class DockShade {
             // 方向决定亮还是灭：升起时白板要提前亮（Dock 一升上来就该采到白），
             // 收起时要立刻灭——底板正往下滑，露出来的是壁纸，
             // 白板留在原地就是一块"比 Dock 晚消失"的白，看着就是延迟。
-            let goingDown = lastCgMinY.map { cg.minY > $0 + 0.5 } ?? false
+            updateMotion(cg.minY)
+            let goingDown = motion == .falling
             rising = !goingDown
-            if goingDown {
-                setAlpha(false)
-            } else {
-                setAlpha(true)
-            }
+            setAlpha(!goingDown)
         } else {
             // 展开到位：贴住实测矩形，顺手学一次 Dock 离屏幕底边的间距
             gap = flip - cg.maxY
             place(panelRect(cg, top: cg.minY, flip: flip))
             rising = false
+            resetMotion()
             setAlpha(true)
         }
 
         // 和白板同一帧推进 Finder 遮盖。
         //
-        // 注意这里传的是**落定位置**的 Dock 矩形，不是实时的 cg：
-        // AX 报的位置比屏幕实际渲染滞后约 150ms（实测升起动画里底板已经到 860，
-        // AX 还报 886），跟着它走遮罩就会慢半拍、让 Finder 露出来一大截。
-        // 遮罩盖的是一块固定的面积，Dock 最终一定会到落定位置，
-        // 所以直接按落点画——动画期间多盖的部分是白板/屏外，看不出来。
-        // 白板自己也是这么做的（见上面 rising 分支的注释）。
+        // 几何按**落定位置**画，不是实时 cg：AX 报的位置比屏幕实际渲染滞后
+        // （升起动画里底板已经到 860，AX 还报 886），拿它算遮罩的矩形会算歪。
+        // 遮罩盖的是一块固定的面积，Dock 最终一定会到落定位置。
+        // 只有收起时的位移例外，见下面的 slide。
         let settledTube = CGRect(x: cg.minX, y: settledTop,
                                  width: cg.width, height: cg.height)
-        // dockVisible 用白板自己的状态：它已经知道 Dock 是否在屏上。
         // settled：只有 Dock 真的停在落点时才让遮罩去读 AX 校准图标偏移。
+        // 收起动画里遮盖块必须跟着图标一起往下滑——白板可以立刻灭（底板下方
+        // 露出来的是壁纸），但 Finder 那一格如果留在原地，图标会从它下面露出来
+        // （实测收起后 105ms、图标已经下滑 20pt 时，遮盖块 alpha 已经是 0，
+        //   Finder 槽里有 1743 个彩色像素、y 861..899，就是用户看到的"闪一下"）。
+        //
+        // 位移直接用 AX 报的 Dock 顶边：实测它比屏幕上的实际渲染**滞后约 8pt**
+        // （图标下滑 20pt 时 AX 只报 13pt），拿它当偏移等于让遮盖块略微滞后，
+        // 永远不会比图标先走，也就不会露出图标上沿。
+        // 遮盖块上边本来就比图标高 14pt、下边低 5pt，这点滞后全落在余量里。
+        //
+        // 再往前补 5pt：上面那个"滞后 8pt"是实测均值，补 5 之后遮盖块/压平层
+        // 相对底板只偏低 3pt——底板顶边上方多出 3pt 白，比少盖 8pt（顶边露出
+        // 一条深灰）更容易忽略。也不能补满 8：这 8pt 不是常数，动画起止时
+        // 速度慢、滞后小，补满就会让遮盖块比图标先走，反而把图标上沿露出来。
+        let rawSlide = max(0, cg.minY - settledTop)
+        let slide = rawSlide > 0 ? rawSlide + 5 : 0
         lastCgMinY = cg.minY
         finderHider?.sync(tube: settledTube, flip: flip,
-                          dockVisible: alphaOn || rising, settled: !rising)
+                          dockVisible: onScreen,
+                          settled: !rising && slide < 0.5,
+                          slide: slide)
         // 内阴影带的下沿：图标真正开始绘制的那一行（AX 图标矩形从 826 起，
         // 但那是命中区，实测第一行彩色像素在 841）。
         // 下沿停在 840（settledTop 821 + 20，含 840 这一行）。
@@ -326,7 +367,7 @@ final class DockShade {
         // 也就是说图标的抗锯齿实际从 841 才开始有可见像素，之前的暗行都是
         // 压平层自己下边缘的半行抗锯齿。
         topFlattener?.sync(tube: settledTube, innerTop: settledTop + 20, flip: flip,
-                           dockVisible: alphaOn || rising)
+                           dockVisible: onScreen, slide: slide)
     }
 }
 
@@ -642,7 +683,9 @@ final class DockTopFlattener {
     }
 
     /// tube 是落定的 Dock 命中区矩形；`innerTop` 是内阴影带的底边（屏幕坐标）。
-    func sync(tube: CGRect, innerTop: CGFloat, flip: CGFloat, dockVisible: Bool) {
+    /// `slide` 是 Dock 收起时已经下滑的点数（0 表示停在落定位置）。
+    func sync(tube: CGRect, innerTop: CGFloat, flip: CGFloat, dockVisible: Bool,
+              slide: CGFloat = 0) {
         guard dockVisible else { hide(); return }
         // 带子从底板顶边（命中区顶 + 5）到最后一行非图标像素。
         let screenTop = tube.minY + 5
@@ -650,13 +693,19 @@ final class DockTopFlattener {
         guard screenBottom > screenTop else { hide(); return }
         // 铺满整条，两端的圆角交给视图自己裁（见 DockTopFlatView）。
         // 缩进的做法会在圆角区留下一块没压平的暗区，交界处出现一条竖直硬边。
-        let target = CGRect(x: tube.minX,
+        var target = CGRect(x: tube.minX,
                             y: flip - screenBottom,
                             width: tube.width,
                             height: screenBottom - screenTop)
+        // 收起动画里压平层要跟着 Dock 一起下滑，不能直接灭掉：
+        // Dock 收起时屏幕上能看到的其实主要是这条内阴影带（底板本体的
+        // 平坦区跟着滑出屏幕了），不压平就是一条深灰横条在往下走。
+        target.origin.y -= slide
         if applied != target {
             applied = target
-            window.setFrame(target, display: true)
+            // 纯位移不重绘：收起动画里这一层每帧都在移动，
+            // 内容（渐变）不变，交给窗口服务器搬表面就够。
+            window.setFrame(target, display: target.size != window.frame.size)
             window.orderFrontRegardless()
             if window.alphaValue < 1 { window.alphaValue = 1 }
         } else if window.alphaValue < 1 {
@@ -777,24 +826,55 @@ final class FinderHider {
     /// 由 DockShade 的跟踪循环每帧调用。
     ///
     /// `tube` 必须是**落定位置**的 Dock 条矩形（不是动画中的实时位置）：
-    /// AX 报的位置比屏幕实际渲染滞后约 150ms，跟着它走遮罩会慢半拍、让 Finder 露出来。
+    /// AX 报的位置比屏幕实际渲染滞后（升起动画最快时能差 25pt 以上），
+    /// 拿它算遮罩的矩形会慢半拍、让 Finder 露出来。
     /// `settled` 表示 Dock 此刻真的在落定位置——只有这时才去读 AX 算图标偏移，
     /// 动画中读到的偏移会被算歪（实测会把遮罩算到屏幕外 y=-73）。
-    func sync(tube: CGRect, flip: CGFloat, dockVisible: Bool, settled: Bool) {
+    /// `slide` 是 Dock 收起动画里已经下滑的点数（0 表示停在落定位置）。
+    /// 收起时遮盖块要跟着图标一起滑下去，否则图标会从它下面露出来。
+    func sync(tube: CGRect, flip: CGFloat, dockVisible: Bool, settled: Bool,
+              slide: CGFloat = 0) {
         guard dockVisible else { hide(); return }
         guard let item = finderItem(settled: settled, flip: flip) else { hide(); return }
 
-        let target = coverRect(for: item, flip: flip, dockLeft: tube.minX)
+        var target = coverRect(for: item, flip: flip, dockLeft: tube.minX)
+        // 只要不在稳定落定状态，就把下沿推到屏幕外再往下 24pt。
+        //
+        // 两个原因：
+        //
+        // 1. 落定位置的下沿在 `屏幕底 - 5`，左下角还是圆的（半径 16），
+        //    正好和底板自己的圆角重合，静止时看不出缺口。图标一往下滑，
+        //    缺口就切到图标左下角，屏幕最底部会露出一小段蓝色圆弧。
+        // 2. 收起刚开始的 0~110ms 里 AX 还没报位移（`rawSlide` 仍是 0），
+        //    但屏幕上的底板/图标已经在往下走了。实测这段时间里屏幕最底
+        //    5pt（y 894..899）会露出 Finder 图标本体 500 多个像素，
+        //    形状正是底板左下圆角的缺口——这不是"滑块没跟上"，
+        //    而是滑块还停在落定点，图标已经从它下面的缺口钻出来了。
+        //
+        // 所以判据不能是 `slide > 0`，必须是"Dock 没停在落定位置"。
+        // 一旦停稳（settled = true）就恢复圆角，静止画面和原来完全一致。
+        if slide > 0 || !settled {
+            let extra: CGFloat = 24
+            target.origin.y -= extra
+            target.size.height += extra
+        }
+        // AppKit 的 y 是窗口底边：往屏幕下方滑 = y 减小。
+        target.origin.y -= slide
 
         if applied != target {
             applied = target
-            window.setFrame(target, display: true)
+            // 只有尺寸变了才需要重画；纯位移交给窗口服务器搬已有的表面，
+            // 120Hz 动画里能省掉每帧一次绘制。
+            window.setFrame(target, display: target.size != window.frame.size)
             window.orderFrontRegardless()
             if window.alphaValue < 1 { window.alphaValue = 1 }
         } else if window.alphaValue < 1 {
             window.alphaValue = 1
         }
     }
+
+    /// 遮盖块当前是否可见。DockShade.engaged 用它决定要不要继续跟踪。
+    var isVisible: Bool { window.alphaValue > 0 }
 
     /// 面板没开时的自驱路径。
     func refresh() {
