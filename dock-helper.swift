@@ -58,30 +58,48 @@ final class PanelView: NSView {
         // 白板只是"垫在 Dock 后面的白纸"，不需要自己描出 Dock 的轮廓：
         // Dock 底板会把整块采样掉，白板自己的边缘只在超出底板时才会露出来。
         //
-        // **整块只填一种颜色，不分上下段。**
+        // **整块只有一种颜色：白色。** 上下不分段、底部也不单独补色。
         //
-        // 早先为了让 Dock 最底那几 pt（底板到「屏幕底 - 6」就不再画了，下面是壁纸）
-        // 不发亮，把白板拆成"上半白色 + 底部一条底板色"。结果两段之间多了一条
-        // 明显更亮的横带：Dock 对上半段的白色采样得到 236，对下半段的底色几乎
-        // 原样透出，交界处就像一盏投光灯打过去。上下必须是一整块。
+        // 踩过的两个坑，都别再犯：
+        //
+        // 1. 把白板拆成"上半白色 + 底部一条底板色"，想在 Dock 底板停止绘制
+        //    的那几 pt 补上颜色。结果两段交界处出现一条横贯 Dock 的亮带——
+        //    Dock 对上半段的白色采样成 236 的灰，对下半段的底色几乎原样透出。
+        // 2. 底部那几 pt 改用「Dock 渐变末端色」（227）。虽然接缝没了，
+        //    但那一段是 Dock **不采样**的，露出来的就是白板自己的颜色——
+        //    于是 Dock 最底一条是 227 的灰、和上面 236 的灰不是一回事，
+        //    看起来还是有颜色、不干净。整块白色最省事。
+        //
+        // 形状：**上圆下直的六边形轮廓**。
+        //
+        // 上面两个角必须圆（半径跟 Dock 一致），否则方角会从 Dock 的圆角
+        // 外侧支出来——屏幕左上/右上各多一个白角。
+        //
+        // 下面两个角必须**直角**。Dock 底板只画到「屏幕底 - 6」，最底那几 pt
+        // 是它不绘制的地方，露出来的就是白板。要是下面也画圆角，那块圆角外侧
+        // （屏幕左下/右下）就直接露出壁纸，看起来是两个直角状的浅色缺口。
+        // Dock 自己的圆角画在白板之上，所以白板这里是直角也看不出来。
         //
         // 上、左、右内缩 1pt：让白板自己的抗锯齿边落在底板之内，否则两圈
         // 抗锯齿边互相咬合会在四角留下细碎灰点。
-        // **下边不内缩**：Dock 底板只画到「屏幕底 - 6」，再往下是壁纸；
-        // 白板要是也缩 1pt，最底就会漏出一条纯白。铺到屏幕最底才对。
-        let body = CGRect(x: bounds.minX + 1, y: bounds.minY,
-                          width: bounds.width - 2, height: bounds.height - 1)
-        let path = CGPath(roundedRect: body, cornerWidth: dockPanelCornerRadius,
-                          cornerHeight: dockPanelCornerRadius, transform: nil)
+        // **下边不内缩**：白板要铺到屏幕最底，缩了最底会漏出一条壁纸色。
+        let r = dockPanelCornerRadius
+        let minX = bounds.minX + 1
+        let maxX = bounds.maxX - 1
+        let minY = bounds.minY
+        let maxY = bounds.maxY - 1
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: maxX, y: minY))
+        path.addLine(to: CGPoint(x: maxX, y: maxY - r))
+        path.addArc(tangent1End: CGPoint(x: maxX, y: maxY),
+                    tangent2End: CGPoint(x: maxX - r, y: maxY), radius: r)
+        path.addLine(to: CGPoint(x: minX + r, y: maxY))
+        path.addArc(tangent1End: CGPoint(x: minX, y: maxY),
+                    tangent2End: CGPoint(x: minX, y: maxY - r), radius: r)
+        path.addLine(to: CGPoint(x: minX, y: minY))
+        path.closeSubpath()
         NSColor.white.setFill()
         NSBezierPath(cgPath: path).fill()
-
-        // 最底那几 pt（Dock 底板不再绘制的地方）用 Dock 渐变末端的颜色，
-        // 和上面接上。见 dockBaseVeryBottom 的注释。
-        let strip = CGRect(x: bounds.minX + 1, y: bounds.minY,
-                           width: bounds.width - 2, height: 7)
-        dockBaseVeryBottom.setFill()
-        strip.fill()
     }
 }
 
@@ -1137,12 +1155,18 @@ final class FinderHider {
 
 // 两个圆角半径是不同的东西，别混：
 //
-// dockPanelCornerRadius —— 白板和顶部压平层用来画自己轮廓的半径。
-//   实测 Dock 底板的左上圆角轮廓（相对窗口原点）：offset 2 → x=132、offset 4 → 128、
-//   offset 8 → 123、offset 14 → 120、offset 24 → 118（直边），拟合半径约 16。
-//   但白板/压平层都内缩了 1pt 以上，用 23 反而更贴合视觉效果（边缘不会露出直角的
-//   硬折角）。这个值只影响"自己画出来的形状"，不影响采样结果。
-let dockPanelCornerRadius: CGFloat = 23
+// dockPanelCornerRadius —— 白板用来画自己轮廓的半径。
+//
+// **必须和 Dock 自己的圆角对齐，不能更大**。实测 Dock 底板的圆角（屏幕坐标，
+// Dock 左边界 x=197）：y=826 → x=214、y=828 → 207、y=830 → 203.5、
+// y=834 → 199.5、y=841 → 197（直边），拟合圆心 (214, 843)、半径约 17。
+//
+// 白板用 17（等于 Dock 的半径）时，白板的圆角刚好落在 Dock 圆角之内，
+// 被完全采样掉。早先写 23——那时白板比 Dock 宽、圆角落在底板外侧，
+// 大一点能避免直角硬边。现在白板和 Dock 等宽，23 会让白板的圆弧收得
+// 比 Dock 更多，圆角**外侧**（屏幕左下/右下）露出一块直角浅色，和 Dock
+// 的圆弧对不上。
+let dockPanelCornerRadius: CGFloat = 17
 
 /// Finder 遮盖块的圆角半径。遮盖块要精确卡在底板圆角上（它的边界是可见的），
 /// 所以用实测拟合值。
@@ -1166,14 +1190,6 @@ let dockCornerRadius: CGFloat = 16
 /// （实测遮盖块顶端用 234 时，交界比压平层暗 3 级，形成阶梯状接缝）。
 let dockBaseTop = NSColor(srgbRed: 237.0 / 255, green: 236.0 / 255, blue: 234.0 / 255, alpha: 1)
 let dockBaseBottom = NSColor(srgbRed: 236.0 / 255, green: 235.0 / 255, blue: 233.0 / 255, alpha: 1)
-
-/// Dock 底板**最下沿**实际渲染出来的颜色（在面板上垫着白板时的实测值）。
-///
-/// Dock 自己会在这块区域叠一层竖直渐变：顶端 237、底端 227（实测 x=400 那一列，
-/// 826 → 894）。而底板只画到「屏幕底 - 6」，再往下就轮到我们垫的白板露出来了。
-/// 那段必须用 227 而不是 236，否则 Dock 的渐变走到 227 之后突然跳回 236，
-/// 屏幕最底下多一条亮带——就是看起来"上下没连成一个整体"的那条缝。
-let dockBaseVeryBottom = NSColor(srgbRed: 227.0 / 255, green: 227.0 / 255, blue: 225.0 / 255, alpha: 1)
 
 /// Dock 底色的视觉近似：和底板同色的圆角块。
 final class FinderHiderView: NSView {
