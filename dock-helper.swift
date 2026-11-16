@@ -28,6 +28,7 @@
 import AppKit
 import ApplicationServices
 import CoreMedia
+import QuartzCore
 import ScreenCaptureKit
 
 let dbgOn = ProcessInfo.processInfo.environment["DOCK_SHADE_DEBUG"] != nil
@@ -49,6 +50,22 @@ func requestAccessibility() {
     FileHandle.standardError.write("等待授权：系统设置 → 隐私与安全性 → 辅助功能 → 点 + 添加 \(exe) 并勾选\n".data(using: .utf8)!)
     try? FileManager.default.createDirectory(atPath: NSHomeDirectory() + "/.cache", withIntermediateDirectories: true)
     try? String(mtime).write(toFile: marker, atomically: true, encoding: .utf8)
+}
+
+// MARK: - 图层不透明度（无隐式动画）
+
+/// 立刻把某个视图的图层不透明度设成指定值。
+///
+/// **必须包在 `CATransaction` 里。** CALayer 的属性变化默认带 0.25 秒的隐式动画，
+/// 直接写 `layer.opacity = x` 会看到一段渐变过程：菜单栏从 1 淡到 0.01 的那 130ms 里
+/// 是半透明的，底下系统原生的灰/黑菜单栏就会透出来——表现就是"切换全屏时
+/// 菜单栏先黑一下再变白"。实测那一小段的中位亮度会从 228 一路掉到 3。
+func setLayerOpacityImmediately(_ view: NSView?, _ value: Float) {
+    guard let layer = view?.layer else { return }
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    layer.opacity = value
+    CATransaction.commit()
 }
 
 // MARK: - 面板模式
@@ -861,7 +878,7 @@ final class DockTopFlatView: NSView {
     /// 隐藏状态：只改图层不透明度，不重画。
     /// 原因见 FinderHiderView.faded（重画要打包上传，100ms 起）。
     var faded = false {
-        didSet { layer?.opacity = faded ? 0.01 : 1 }
+        didSet { setLayerOpacityImmediately(self, faded ? 0.01 : 1) }
     }
 
     override init(frame: NSRect) {
@@ -1209,7 +1226,7 @@ final class FinderHiderView: NSView {
     ///
     /// 0.01 在视觉上等于没有：底色 237 上偏 2 级、白 250 上偏不到 1 级。
     var faded = false {
-        didSet { layer?.opacity = faded ? 0.01 : 1 }
+        didSet { setLayerOpacityImmediately(self, faded ? 0.01 : 1) }
     }
 
     override init(frame: NSRect) {
@@ -1314,7 +1331,7 @@ func finderDockItemRect() -> CGRect? {
 final class MenuBarLineView: NSView {
     /// 隐藏状态：只改图层不透明度（理由见 MenuBarImageView.faded）。
     var faded = false {
-        didSet { layer?.opacity = faded ? 0.01 : 1 }
+        didSet { setLayerOpacityImmediately(self, faded ? 0.01 : 1) }
     }
 
     override init(frame: NSRect) {
@@ -1342,7 +1359,7 @@ final class MenuBarImageView: NSView {
     /// 重建表面，实测 150~200ms。菜单栏全屏进出、自动隐藏都会走这里，
     /// 每次都要重新贴一张 1600×30 的位图，冷启动那一下会露灰边。
     var faded = false {
-        didSet { layer?.opacity = faded ? 0.01 : 1 }
+        didSet { setLayerOpacityImmediately(self, faded ? 0.01 : 1) }
     }
 
     override init(frame: NSRect) {
@@ -1658,15 +1675,20 @@ final class MenuBarClean {
         capture.start()
     }
 
-    /// 菜单栏不可用时藏掉两层。
+    /// 菜单栏当前不可用（全屏 App 占满、或自动隐藏）。
     ///
-    /// **不把窗口挪到屏幕外**：那会让窗口服务器丢掉它的表面，重新上屏要
-    /// 重建（实测 150~200ms，Dock 那边同样踩过）。窗口留在原位，只把内容
-    /// 画成透明——反正这块区域本来就是菜单栏的地盘。
+    /// **什么都不做，不要淡出。**
+    ///
+    /// 早先这里把两层补成透明，理由是"菜单栏不在了，白板也该收起来"。
+    /// 结果是切换全屏时闪一下黑：进出全屏的那一两帧里 `visibleFrame` 会先
+    /// 变成整屏（高度 0）、过一两帧再变成 31，于是 parkAll() 淡出、下一帧
+    /// 又淡入。淡出的那 130ms 里两层是半透明的，底下的网页/壁纸直接透出来——
+    /// 实测抓到过一帧：菜单栏文字还在，但背景能看到后面 Chrome 页面的字。
+    ///
+    /// 而白色层本来就该一直在那里：菜单栏区域被全屏内容盖住时，它露不出来；
+    /// 菜单栏回来时它已经就位，不会有任何过渡。所以这个函数只记状态。
     private func parkAll() {
         lastBar = 0
-        (bg.contentView as? MenuBarImageView)?.faded = true
-        (line.contentView as? MenuBarLineView)?.faded = true
     }
 
     private func show(_ img: CGImage, _ logical: CGSize) {
@@ -1744,7 +1766,9 @@ final class MenuBarClean {
         // 原来的 stream 订阅的是**已消失的那个菜单栏窗口**，永远等不到帧。
         // 这里每隔几秒重试一次（restart 内部会先摘掉旧 stream）。
         guard hasImage else {
-            (bg.contentView as? MenuBarImageView)?.faded = true
+            // 还没有采集帧时保留上一次的画面（白色底 + 旧图标），
+            // **不要淡出**：那会在切全屏、刚唤醒这类时刻露出一段半透明。
+            // 旧图标只会在菜单栏刚变化时多留一两帧，比露底干净得多。
             if Date().timeIntervalSince(noImageSince) > 3 {
                 noImageSince = Date()
                 capture.restart()
