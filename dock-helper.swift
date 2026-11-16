@@ -1269,6 +1269,19 @@ func finderDockItemRect() -> CGRect? {
 // (纯绘制，无需权限)，不会留下黑屏或白块。
 
 final class MenuBarLineView: NSView {
+    /// 隐藏状态：只改图层不透明度（理由见 MenuBarImageView.faded）。
+    var faded = false {
+        didSet { layer?.opacity = faded ? 0.01 : 1 }
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layerContentsRedrawPolicy = .onSetNeedsDisplay
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
     override func draw(_ dirtyRect: NSRect) {
         NSColor.white.setFill()
         bounds.fill()
@@ -1278,6 +1291,25 @@ final class MenuBarLineView: NSView {
 final class MenuBarImageView: NSView {
     var image: CGImage?
     var imagePointSize = CGSize.zero
+
+    /// 隐藏状态：只改图层不透明度，不重画、也不把窗口搬出屏幕。
+    ///
+    /// 这两条是 Dock 那边踩出来的（见 FinderHiderView.faded）：窗口一旦被判为
+    /// 不可见（alpha=0 或离开屏幕），窗口服务器就把它摘出合成，重新上屏要
+    /// 重建表面，实测 150~200ms。菜单栏全屏进出、自动隐藏都会走这里，
+    /// 每次都要重新贴一张 1600×30 的位图，冷启动那一下会露灰边。
+    var faded = false {
+        didSet { layer?.opacity = faded ? 0.01 : 1 }
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layerContentsRedrawPolicy = .onSetNeedsDisplay
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         NSColor.white.setFill()
@@ -1322,8 +1354,26 @@ final class MenuBarCapture: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             guard let self else { return }
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                // 菜单栏窗口：Window Server 的 layer 24、标题 "Menubar"，没有 owningApplication
-                guard let bar = content.windows.first(where: { $0.windowLayer == 24 && $0.frame.width > 400 }) else {
+                // 菜单栏窗口：Window Server 的 layer 24、标题 "Menubar"、宽 1600。
+                //
+                // **必须用标题认，不能只看 layer 和宽度**。早先写的是
+                // `layer == 24 && width > 400`，后来自己在 layer 24 上加了 Dock 压平层
+                // （1258×15，宽度也 > 400），它在 SCShareableContent 里排在菜单栏前面，
+                // 于是被当成菜单栏采走。那张图整片是 237 的底色（几乎没有暗像素），
+                // 漂白后贴到菜单栏上，菜单栏就成了一整条纯白——图标、文字全被盖掉。
+                //
+                // 也不能靠 `owningApplication == nil` 认：它有值是 Window Server
+                // （pid 418），只是 applicationName 为空。
+                //
+                // 菜单栏自动隐藏、或有 App 停在另一个全屏空间时，菜单栏窗口的 y
+                // 会变成 -30/-62，`onScreenWindowsOnly: true` 一个都返回不了。
+                // 那时菜单栏本来就不该处理，这里认不出来是正常的：
+                // MenuBarClean.update() 看到 barHeight == 0 就会把两层淡出。
+                let pid = getpid()
+                guard let bar = content.windows.first(where: {
+                    $0.windowLayer == 24 && $0.title == "Menubar"
+                        && $0.owningApplication?.processID != pid
+                }) else {
                     throw NSError(domain: "dock-tools", code: 1,
                                   userInfo: [NSLocalizedDescriptionKey: "找不到菜单栏窗口"])
                 }
@@ -1519,7 +1569,12 @@ final class MenuBarClean {
     init() {
         let menuLevel = Int(CGWindowLevelForKey(.mainMenuWindow))
 
-        bg = NSWindow(contentRect: CGRect(x: 0, y: -20000, width: 4, height: 4),
+        // 初始就摆在菜单栏该在的位置、但画成透明（而不是先挪到屏幕外再搬回来）：
+        // 窗口搬出屏幕会丢掉表面，搬回来要重建（实测 150~200ms）。
+        // 这里只要知道主屏顶边就够了。
+        let f = NSScreen.screens.first?.frame ?? CGRect(x: 0, y: 0, width: 1600, height: 900)
+        let start = CGRect(x: f.minX, y: f.maxY - 31, width: f.width, height: 31)
+        bg = NSWindow(contentRect: start,
                       styleMask: .borderless, backing: .buffered, defer: false)
         bg.isOpaque = true
         bg.backgroundColor = .white
@@ -1529,9 +1584,12 @@ final class MenuBarClean {
         bg.isReleasedWhenClosed = false
         bg.level = NSWindow.Level(rawValue: menuLevel + 1)
         bg.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        let bgv = MenuBarImageView(frame: CGRect(origin: .zero, size: start.size))
+        bgv.faded = true        // 还没图，先隐着
+        bg.contentView = bgv
         bg.orderFrontRegardless()
 
-        line = NSWindow(contentRect: CGRect(x: 0, y: -20000, width: 4, height: 1),
+        line = NSWindow(contentRect: CGRect(x: f.minX, y: f.maxY - 1, width: f.width, height: 1),
                         styleMask: .borderless, backing: .buffered, defer: false)
         line.isOpaque = true
         line.backgroundColor = .white
@@ -1541,19 +1599,26 @@ final class MenuBarClean {
         line.isReleasedWhenClosed = false
         line.level = NSWindow.Level(rawValue: menuLevel + 1)
         line.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
-        line.contentView = MenuBarLineView(frame: CGRect(x: 0, y: 0, width: 4, height: 1))
+        let lv = MenuBarLineView(frame: CGRect(x: 0, y: 0, width: f.width, height: 1))
+        // 底边那条白条一开始就要显示：它是 1pt 深线唯一的遮法，
+        // 没有它、又还没拿到采集帧时，屏幕顶上会留着那条灰线。
+        lv.faded = false
+        line.contentView = lv
         line.orderFrontRegardless()
 
         capture.onFrame = { [weak self] img, _, logical in self?.show(img, logical) }
         capture.start()
     }
 
+    /// 菜单栏不可用时藏掉两层。
+    ///
+    /// **不把窗口挪到屏幕外**：那会让窗口服务器丢掉它的表面，重新上屏要
+    /// 重建（实测 150~200ms，Dock 那边同样踩过）。窗口留在原位，只把内容
+    /// 画成透明——反正这块区域本来就是菜单栏的地盘。
     private func parkAll() {
         lastBar = 0
-        let off = CGRect(x: 0, y: -20000, width: 4, height: 4)
-        if bg.frame != off { bg.setFrame(off, display: false) }
-        let offLine = CGRect(x: 0, y: -20000, width: 4, height: 1)
-        if line.frame != offLine { line.setFrame(offLine, display: false) }
+        (bg.contentView as? MenuBarImageView)?.faded = true
+        (line.contentView as? MenuBarLineView)?.faded = true
     }
 
     private func show(_ img: CGImage, _ logical: CGSize) {
@@ -1569,6 +1634,7 @@ final class MenuBarClean {
             v.imagePointSize = logical
             bg.contentView = v
         }
+        (bg.contentView as? MenuBarImageView)?.faded = false
         update()
     }
 
@@ -1620,10 +1686,10 @@ final class MenuBarClean {
             line.orderFrontRegardless()
         }
 
-        // 还没有图（没授权 / stream 还没来第一帧）：只保留底边那条白条
+        // 还没有图（没授权 / stream 还没来第一帧）：
+        // 底色层藏起来（留底边那条白条，那是 1pt 深线唯一的遮法）
         guard hasImage else {
-            let off = CGRect(x: 0, y: -20000, width: 4, height: 4)
-            if bg.frame != off { bg.setFrame(off, display: false) }
+            (bg.contentView as? MenuBarImageView)?.faded = true
             return
         }
 
@@ -1635,6 +1701,7 @@ final class MenuBarClean {
             // 底色层换位后，底边白条要重新提到最前，否则会被盖住
             line.orderFrontRegardless()
         }
+        (bg.contentView as? MenuBarImageView)?.faded = false
 
         if bar != lastBar {
             let reappeared = lastBar == 0

@@ -2,6 +2,57 @@
 
 记录 dock-tools 的优化历程和重要变更。README 只保留当前状态，历史细节放这里。
 
+## 菜单栏整条变纯白、图标全没了（2026-11-16）
+
+现象：菜单栏背景是白的、但一个图标和文字都没有，像被盖了一张白纸。
+
+### 根因：菜单栏采集选错了窗口
+
+`MenuBarCapture` 找菜单栏窗口的条件写的是：
+
+```swift
+content.windows.first { $0.windowLayer == 24 && $0.frame.width > 400 }
+```
+
+而注释里那句「layer 24、标题 Menubar、没有 owningApplication」，**只有 layer 24 真的
+落实到了代码里**。后来给 Dock 加顶部压平层时，`DockTopFlattener` 也在 level 24、
+宽 1258——它同样满足 `width > 400`，而且在 `SCShareableContent` 里排在菜单栏
+**前面**。于是采到的是那张 237 渐变色的窄条，漂白后（几乎没有暗像素，整片被推成
+255）贴到菜单栏上，菜单栏就成了纯白。
+
+修复：三个条件都判——`windowLayer == 24 && title == "Menubar"`，
+并且排除自己的进程（`owningApplication?.processID != getpid()`）。
+
+> 不能靠 `owningApplication == nil` 认：它有值，是 Window Server（pid 418），
+> 只是 `applicationName` 为空。
+
+### 排查中被误认为问题的两件事
+
+- **菜单栏窗口在 `SCShareableContent` 里 y=-30/-62**：这是菜单栏自动隐藏或
+  某个 App 停在另一个全屏空间时的正常表现，`onScreenWindowsOnly: true` 一个都不返回。
+  当时正好在测自动隐藏，把菜单栏设成了自动隐藏且 Chrome 留在全屏空间里，
+  于是看起来像"菜单栏窗口消失了"。切回普通桌面就恢复。
+- **测试时把菜单栏设成了自动隐藏**（`_HIHideMenuBar=1`），用户要求常驻。
+  测完已改回 0。
+
+### 顺带：菜单栏两层也改成"不搬出屏幕"
+
+`parkAll()`（全屏/自动隐藏时）原来把 `bg`、`line` 两个窗口挪到 `y = -20000`。
+这跟 Dock 那边踩的是同一个坑：窗口离开屏幕后窗口服务器会丢掉它的表面，
+回来要重建（实测 150~200ms），全屏进出时会露一下灰边。
+
+改成：窗口留在菜单栏原位，只把图层 `opacity` 设成 0.01（和 `FinderHiderView.faded`
+同一套做法）。初始创建时也不再先放到 -20000 再搬回来。
+
+### 验证
+
+- 菜单栏 0..30pt 全是 `255,255,255`，底边那条 1pt 深线也被压掉；
+  y=31 起是壁纸色 `249,247,241`，与关掉 helper 时一致。
+- 图标、文字完整：放大截图确认「访达 / OpenCode / Chrome」三态都清晰。
+- 切换 App 后菜单栏 1 秒内跟上（实测 Chrome → 访达 → Chrome）。
+- 全屏进出、菜单展开收起都正常。
+- Dock 方向回归：升起 3/3、收起 3/3 无漏帧；落定画面与上一版逐行一致。
+
 ## 升起 Dock 时 Finder 那一格也闪（2026-11-16）
 
 上一节修完收起方向，升起方向还在漏：Finder 图标在 Dock 升到一半时整块露出来，
