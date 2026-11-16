@@ -447,14 +447,22 @@ apply() {
     launchctl bootout "gui/${uid}/${LABEL}" >/dev/null 2>&1 || true
     stop_helper
     stop_menu
-    sleep 1
+    # bootout 之后 launchd 还要几十毫秒才把旧 service 真正摘干净。
+    # 早先只 sleep 1 就开始 bootstrap，实测会连着三次返回
+    # "5: Input/output error"，然后 apply 直接失败——但等一会儿手动
+    # bootstrap 又是好的。所以这里等到 launchctl print 真的查不到了再继续。
+    local wait
+    for wait in 1 2 3 4 5 6 7 8 9 10; do
+        launchctl print "gui/${uid}/${LABEL}" >/dev/null 2>&1 || break
+        sleep 0.3
+    done
     # bootstrap 偶发 "5: Input/output error"，是瞬时错误，重试就好
     local i
-    for i in 1 2 3; do
+    for i in 1 2 3 4 5; do
         if launchctl bootstrap "gui/${uid}" "$HOME/Library/LaunchAgents/${LABEL}.plist" 2>>"$LOG"; then
             break
         fi
-        if [ "$i" = 3 ]; then
+        if [ "$i" = 5 ]; then
             echo "launchctl bootstrap 连续失败，看 $LOG" >&2
             exit 1
         fi

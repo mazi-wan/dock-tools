@@ -1370,12 +1370,17 @@ final class MenuBarCapture: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 // 那时菜单栏本来就不该处理，这里认不出来是正常的：
                 // MenuBarClean.update() 看到 barHeight == 0 就会把两层淡出。
                 let pid = getpid()
-                guard let bar = content.windows.first(where: {
+                let bar = content.windows.first {
                     $0.windowLayer == 24 && $0.title == "Menubar"
                         && $0.owningApplication?.processID != pid
-                }) else {
-                    throw NSError(domain: "dock-tools", code: 1,
-                                  userInfo: [NSLocalizedDescriptionKey: "找不到菜单栏窗口"])
+                }
+                // 没有菜单栏窗口是**正常状态**：全屏 App 占着空间、或菜单栏自动隐藏时
+                // 它就不在屏上。这时不报「需要屏幕录制权限」（那会每 30 秒刷一条日志），
+                // 也不自己重试——等菜单栏回来时 MenuBarClean.update() 会发现
+                // barHeight > 0 且 hasImage == false，调 restart() 重建。
+                guard let bar else {
+                    await MainActor.run { self.starting = false }
+                    return
                 }
                 let filter = SCContentFilter(desktopIndependentWindow: bar)
                 let scale = CGFloat(filter.pointPixelScale)
@@ -1661,6 +1666,9 @@ final class MenuBarClean {
     /// 所以缓存起来，靠尺寸和屏幕参数通知失效。
     private var cachedBar: CGFloat?
     private var cachedScreenSize = CGSize.zero
+    /// 上次「手上没有采集帧」的时刻。用来限流 restart()：
+    /// 菜单栏不在屏上时 restart 也拿不到窗口，不能每 2 秒都重建一次 stream。
+    private var noImageSince = Date.distantPast
 
     /// 屏幕几何变化（分辨率、菜单栏显隐、Dock 位置）时丢掉缓存。
     func invalidateGeometry() { cachedBar = nil }
@@ -1686,12 +1694,21 @@ final class MenuBarClean {
             line.orderFrontRegardless()
         }
 
-        // 还没有图（没授权 / stream 还没来第一帧）：
-        // 底色层藏起来（留底边那条白条，那是 1pt 深线唯一的遮法）
+        // 还没有图（没授权 / stream 还没来第一帧 / 菜单栏刚从全屏空间回来）：
+        // 底色层藏起来（留底边那条白条，那是 1pt 深线唯一的遮法）。
+        //
+        // 顺手让采集器重新认一次窗口：菜单栏从全屏/自动隐藏状态回来时，
+        // 原来的 stream 订阅的是**已消失的那个菜单栏窗口**，永远等不到帧。
+        // 这里每隔几秒重试一次（restart 内部会先摘掉旧 stream）。
         guard hasImage else {
             (bg.contentView as? MenuBarImageView)?.faded = true
+            if Date().timeIntervalSince(noImageSince) > 3 {
+                noImageSince = Date()
+                capture.restart()
+            }
             return
         }
+        noImageSince = Date()
 
         let bgFrame = CGRect(x: s.frame.minX, y: s.frame.maxY - bar,
                              width: s.frame.width, height: bar)
