@@ -131,7 +131,6 @@ final class DockShade {
     private var gap: CGFloat = 10
     private var alphaOn = false
     private var lastDockPID: pid_t?
-    private var armedUntil = Date.distantPast   // 压过边缘后的保护期，等 AX 跟上
     /// 上一帧 Dock 顶边，用来判断当前是升起还是收起。
     /// 初值是 nil 而不是 ±infinity：第一帧还不知道方向，不该猜成"升起"。
     private var lastCgMinY: CGFloat?
@@ -180,7 +179,7 @@ final class DockShade {
     /// Dock 完全收起、白板也隐藏时，指针在热区里随便移动都不需要查 AX——
     /// 实测这种空转占掉了 helper 常驻开销的一半以上。
     var engaged: Bool {
-        alphaOn || rising || Date() < armedUntil
+        alphaOn || rising
     }
 
     // 白板矩形 = Dock 的 x/宽/高 + 上下留 pad，顶边跟随落定后的 Dock 顶
@@ -230,12 +229,14 @@ final class DockShade {
                       width: cg.width + padX * 2, height: h)
     }
 
-    // 指针压到下边缘：白板本来就停在落定位置（只是透明的），这里立刻点亮。
-    // 不查 AX，避免在事件回调里多等一次 IPC。
+    // 指针压到下边缘：白板本来就停在落定位置（只是透明的），这里立刻点亮，
+    // 好让 Dock 升起的第一帧就采到白。
+    //
+    // 只在"指针刚压上来"那一下点亮（由 Driver 的 atEdge 边沿触发），
+    // 不能每帧都续期 armedUntil——指针停在屏幕底部不动时，Dock 其实会自己收起，
+    // 而 expiresAfter 一直有效会让白板/遮盖块跟着一直亮着，
+    // 表现为"Dock 收起了、Finder 那一块还没消失"。
     func summon() {
-        let now = Date()
-        if now < armedUntil { return }
-        armedUntil = now.addingTimeInterval(0.25)
         setAlpha(true)
         if applied == nil { update() }   // 刚启动还没校准过位置
     }
@@ -266,13 +267,16 @@ final class DockShade {
             // 收起：白板留在落定位置（下次召唤直接点亮，不用再搬窗口），并灭掉。
             // 不灭的话底板已经滑走、白板还亮着，看着就是"白板消失有延迟"。
             //
-            // armedUntil 里的例外：指针刚压到边缘时 summon() 会先点亮白板，
-            // 好让 Dock 升起的第一帧就采到白。但 AX 这时还报"已收起"，
-            // 这里不能再无脑灭掉——否则 summon 和 update 会以 120Hz 互相打架，
-            // 表现为每 250ms 闪一下（同时把 CPU 拉到 2%）。
+            // 这里必须无条件灭掉：Dock 的 AX 已经报"在屏外"，屏幕上也确实收起了，
+            // 白板再亮着就是一块凭空多出来的白（Finder 遮盖块同理）。
+            //
+            // 早期这里写 setAlpha(Date() < armedUntil)，靠一个 0.25 秒保护期保底，
+            // 结果是指针停在屏幕底部不动时 armedUntil 被反复续期，白板和 Finder
+            // 遮盖块会一直亮着不消失。现在 summon() 只在刚压边时点一次，
+            // 不参与这里的判断。
             place(panelRect(cg, top: settledTop, flip: flip))
             rising = false
-            setAlpha(Date() < armedUntil)
+            setAlpha(false)
         } else if cg.minY > settledTop + 1 {
             // 升/收动画中：白板停在最终位置。跟着动画走必然慢半拍，
             // Dock 顶边会先露出背景色，这正是要避免的那一闪。
@@ -331,6 +335,11 @@ final class Driver {
     private var timer: Timer?
     private var holdUntil = Date.distantPast
     private var wasHot = false
+    /// 指针是否压在触发区里。带迟滞：
+    /// 进入按 edgeBand(6pt)，退出要退到 edgeBand + 6pt 才算离开。
+    /// 不加迟滞时指针停在边界上（这台笔屏 y≈898 抖动 ±1pt），
+    /// atEdge 会每帧翻一次，justPressed 反复触发 summon()，
+    /// 白板就以 120Hz 在亮/灭之间抖（日志里能看到 alpha 1→0→1→0）。
     private var atEdge = false
     private var interval: TimeInterval = 0
     private var lastPointer = CGPoint(x: -1, y: -1)
@@ -389,15 +398,20 @@ final class Driver {
         guard let screen else { schedule(idleInterval); return }
         let d = p.y - screen.frame.minY
         let hot = d < hotBand
-        let edge = d <= edgeBand
+        // 迟滞：已经在触发区里就放宽退出阈值，避免边界抖动反复触发
+        let edge = d <= (atEdge ? edgeBand + 6 : edgeBand)
         let now = Date()
 
+        // 只在"指针刚压到边缘"这个边沿点亮白板（而不是压着就每帧点一次）。
+        // 压着不放时 Dock 会自己收起，那时白板必须能灭掉——见 DockShade.update()
+        // 收起分支的注释。
+        let justPressed = edge && !atEdge
         if edge != atEdge {
             atEdge = edge
             dbg("edge=\(edge) d=\(Int(d))")
         }
         // Dock 只在主屏上；副屏压边不该点亮主屏的白板
-        if edge && screen.frame == NSScreen.screens.first?.frame { shade.summon() }
+        if justPressed && screen.frame == NSScreen.screens.first?.frame { shade.summon() }
 
         // Dock 正在屏上/正在进出时才需要搬窗口；纯悬停不碰它
         if shade.engaged {
