@@ -456,18 +456,16 @@ final class DockShade {
                           settled: stable,
                           slide: slide,
                           protectBottom: !(stable && pointerOverDock))
-        // 内阴影带的下沿：图标真正开始绘制的那一行（AX 图标矩形从 826 起，
-        // 但那是命中区，实测第一行彩色像素在 841）。
-        // 下沿停在 840（settledTop 821 + 20，含 840 这一行）。
+        // 内阴影带的下沿。
         //
-        // 这个数字是一行一行试出来的（+17/+18/+19/+20/+21 各跑一遍截图对比）：
-        //   +17、+18 → 838/839 整条暗 4 级，图标上方留一条浅横线
-        //   +19     → 839 好了，但 840 在图标位置是 225（图标抗锯齿被切）
-        //   +20     → 836..840 全部 237，图标从 841 的 16 开始，完整保留  ← 用这个
-        //   +21     → 把图标第一行（841）也盖掉
-        // 也就是说图标的抗锯齿实际从 841 才开始有可见像素，之前的暗行都是
-        // 压平层自己下边缘的半行抗锯齿。
-        topFlattener?.sync(tube: settledTube, innerTop: settledTop + 20, flip: flip,
+        // **不能盖到图标的阴影**。图标白底的上边缘在 841，但它上面还有一圈
+        // 柔和的投影/高光：关掉本工具时 838..840 是 180/188/221 这种渐变。
+        // 早先下沿用 840（settledTop + 20），把这段渐变整个抹成 237，
+        // 图标的顶部圆角看起来就是被一条横线切平的（放大 14 倍很明显）。
+        //
+        // 现在收到 836（settledTop + 15）：只压内阴影带最暗的那几行，
+        // 837 起把图标自己的明暗过渡完整留给 Dock 画。
+        topFlattener?.sync(tube: settledTube, innerTop: settledTop + 15, flip: flip,
                            dockVisible: onScreen, slide: slide)
     }
 }
